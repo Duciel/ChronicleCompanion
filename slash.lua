@@ -116,12 +116,19 @@ function Chronicle:HandleSlashCommand(msg)
 			-- No arg or invalid arg: toggle
 			newVal = not ChronicleLog:GetSetting("includeRealmInFilename")
 		end
+		-- Flush pending lines to the current file before the name changes
+		ChronicleLog:FlushToFile()
 		ChronicleLog:SetSetting("includeRealmInFilename", newVal)
+		ChronicleLog.currentLogFile = nil
 		if newVal then
 			self:Print("Log files now separated per realm. Current file: " .. ChronicleLog:GetLogFilename())
 		else
 			self:Print("Log files no longer separated per realm. Current file: " .. ChronicleLog:GetLogFilename())
 		end
+	elseif cmd == "octo" then
+		ChronicleOcto:Slash(parts[2], parts[3])
+	elseif cmd == "file" then
+		self:Print("Current log file: " .. ChronicleLog:GetLogFilename())
 	elseif cmd == "minimap" then
 		local current = ChronicleLog:GetSetting("showMinimapIcon")
 		local newVal = not current
@@ -148,6 +155,8 @@ function Chronicle:ShowHelp()
 	self:Print("/chronicle inspect <name> - Force talent inspection of a player")
 	self:Print("/chronicle minimap - Toggle minimap icon visibility")
 	self:Print("/chronicle realm [1|0|true|false] - Toggle or set per-realm log file separation")
+	self:Print("/chronicle file - Show the current log file (one per character, instance and day)")
+	self:Print("/chronicle octo [setting] [value] - Extra events (health, power, target, position, marks, threat)")
 	self:Print("/chronicle help - Show this help")
 	self:Print("/clog - Open chronicle log options")
 end
