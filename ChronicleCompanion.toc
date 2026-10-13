@@ -1,7 +1,7 @@
 ## Interface: 11200
 ## Title: ChronicleCompanion
 ## Notes: Use with the website Chronicle (OctoWoW fork: per instance/day files, unit data (health, power, position), targets, marks, threat)
-## Version: 0.38.0+octo2
+## Version: 0.38.1
 ## DefaultState: enabled
 ## Author: Emyrk
 ## SavedVariables: ChronicleCompanionDB

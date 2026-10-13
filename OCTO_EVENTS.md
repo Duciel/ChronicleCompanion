@@ -1,4 +1,4 @@
-# ChronicleCompanion — OctoWoW fork (0.38.0+octo2)
+# ChronicleCompanion — OctoWoW fork (0.38.1)
 
 This fork keeps everything ChronicleCompanion 0.38 writes, plus:
 
@@ -101,7 +101,11 @@ The same table received twice within 1.5 s is written once.
 
 ## Settings
 
-`/chronicle octo` lists them; `/chronicle octo <setting> <value>` changes one.
+The options panel (`/clog` or `/chronicle config`) has an **Extra events**
+side panel on its right: one checkbox per line type, the threat request mode
+(auto / on / off) and the APIs detected. Intervals are only in the slash
+command: `/chronicle octo` lists the settings, `/chronicle octo <setting>
+<value>` changes one.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |

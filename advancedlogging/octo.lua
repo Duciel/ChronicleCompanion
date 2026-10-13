@@ -665,3 +665,146 @@ function Octo:Slash(key, value)
         Chronicle:Print("Unknown octo setting or value: " .. key .. " " .. (value or ""))
     end
 end
+
+-- =============================================================================
+-- Options panel: "Extra events" side panel, docked to the right of the
+-- ChronicleLog options panel (opened with /clog or /chronicle config)
+-- =============================================================================
+
+local UI_TOGGLES = {
+    { key = "unitState", label = "Unit state", desc = "UNIT_STATE: health, power" },
+    { key = "position", label = "Positions", desc = "x / y / z in UNIT_STATE", parent = "unitState" },
+    { key = "target", label = "Mob targets", desc = "UNIT_TARGET: who is tanking" },
+    { key = "marks", label = "Raid marks", desc = "RAID_MARK" },
+    { key = "threat", label = "Threat", desc = "THREAT, THREAT_TANK" },
+}
+local THREAT_QUERY_NEXT = { auto = "on", on = "off", off = "auto" }
+
+function Octo:CreateOptions(panel)
+    local side = CreateFrame("Frame", "ChronicleOctoOptions", panel)
+    side:SetWidth(230)
+    side:SetHeight(panel:GetHeight())
+    side:SetPoint("TOPLEFT", panel, "TOPRIGHT", -4, 0)
+    side:SetBackdrop({
+        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true, tileSize = 32, edgeSize = 32,
+        insets = { left = 11, right = 12, top = 12, bottom = 11 }
+    })
+
+    local title = side:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    title:SetPoint("TOP", 0, -18)
+    title:SetText("Extra events (OctoWoW)")
+
+    local subtitle = side:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    subtitle:SetPoint("TOP", title, "BOTTOM", 0, -2)
+    subtitle:SetText("Lines Chronicle ignores, for analysis")
+
+    local y = -52
+    side.checks = {}
+    for i = 1, table.getn(UI_TOGGLES) do
+        local t = UI_TOGGLES[i]
+        local x = t.parent and 36 or 20
+        local check = CreateFrame("CheckButton", "ChronicleOctoCheck_" .. t.key, side, "UICheckButtonTemplate")
+        check:SetPoint("TOPLEFT", x, y)
+        getglobal(check:GetName() .. "Text"):SetText(t.label)
+        check.key = t.key
+        check:SetScript("OnClick", function()
+            Octo:Set(this.key, this:GetChecked() == 1)
+            Octo:RefreshOptions()
+        end)
+        local desc = side:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+        desc:SetPoint("TOPLEFT", x + 26, y - 20)
+        desc:SetText(t.desc)
+        check.desc = desc
+        side.checks[t.key] = check
+        y = y - 40
+    end
+
+    -- threat requests: auto / on / off
+    local queryLabel = side:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    queryLabel:SetPoint("TOPLEFT", 36, y - 4)
+    queryLabel:SetText("Server requests:")
+    local queryButton = CreateFrame("Button", "ChronicleOctoThreatQuery", side, "UIPanelButtonTemplate")
+    queryButton:SetWidth(55)
+    queryButton:SetHeight(18)
+    queryButton:SetPoint("LEFT", queryLabel, "RIGHT", 6, 0)
+    queryButton:SetScript("OnClick", function()
+        Octo:Set("threatQuery", THREAT_QUERY_NEXT[Octo:Get("threatQuery")] or "auto")
+        Octo:RefreshOptions()
+    end)
+    side.queryButton = queryButton
+    local queryDesc = side:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+    queryDesc:SetPoint("TOPLEFT", 36, y - 20)
+    queryDesc:SetWidth(180)
+    queryDesc:SetJustifyH("LEFT")
+    side.queryDesc = queryDesc
+    y = y - 58
+
+    -- detected APIs
+    local apiHeader = side:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    apiHeader:SetPoint("TOPLEFT", 20, y)
+    apiHeader:SetText("Detected:")
+    local apiText = side:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    apiText:SetPoint("TOPLEFT", 20, y - 14)
+    apiText:SetWidth(195)
+    apiText:SetJustifyH("LEFT")
+    side.apiText = apiText
+
+    local help = side:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+    help:SetPoint("BOTTOMLEFT", 20, 20)
+    help:SetWidth(195)
+    help:SetJustifyH("LEFT")
+    help:SetText("Intervals: /chronicle octo\nFormat: OCTO_EVENTS.md")
+
+    self.options = side
+end
+
+function Octo:RefreshOptions()
+    local side = self.options
+    if not side then return end
+    for key, check in pairs(side.checks) do
+        check:SetChecked(self:Get(key) and 1 or nil)
+    end
+
+    -- positions are part of UNIT_STATE: greyed out when it is off
+    local pos = side.checks.position
+    if self:Get("unitState") then
+        pos:Enable()
+        getglobal(pos:GetName() .. "Text"):SetTextColor(1, 1, 1)
+    else
+        pos:Disable()
+        getglobal(pos:GetName() .. "Text"):SetTextColor(0.5, 0.5, 0.5)
+    end
+
+    local mode = self:Get("threatQuery")
+    side.queryButton:SetText(mode)
+    if self:Get("threat") then side.queryButton:Enable() else side.queryButton:Disable() end
+    local active = self:ThreatQueryActive()
+    if mode == "auto" then
+        side.queryDesc:SetText(active and "auto: no threat addon, this addon asks"
+            or "auto: TWThreat / ThreatPlates ask, this addon listens")
+    elseif mode == "on" then
+        side.queryDesc:SetText("on: this addon always asks the server")
+    else
+        side.queryDesc:SetText("off: only listens to other addons")
+    end
+
+    self:DetectPositionApi()
+    local classicApi = (C_NamePlate ~= nil or GetClassicExpansionLevel ~= nil) and "yes" or "no"
+    side.apiText:SetText("Positions: " .. self.positionApi .. "\nClassicAPI: " .. classicApi
+        .. "\nSuperWoW: " .. (SUPERWOW_VERSION or "no")
+        .. "\nNampower fields: " .. (GetUnitField and "yes" or "no"))
+end
+
+local originalCreateOptionsPanel = ChronicleLog.CreateOptionsPanel
+function ChronicleLog:CreateOptionsPanel()
+    originalCreateOptionsPanel(self)
+    if self.optionsPanel then Octo:CreateOptions(self.optionsPanel) end
+end
+
+local originalRefreshOptionsPanel = ChronicleLog.RefreshOptionsPanel
+function ChronicleLog:RefreshOptionsPanel()
+    originalRefreshOptionsPanel(self)
+    Octo:RefreshOptions()
+end
