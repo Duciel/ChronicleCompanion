@@ -2,10 +2,8 @@
 -- ChronicleLog Octo extensions
 --
 -- Extra log lines for deeper raid analysis on OctoWoW (1.12 client):
---   HEALTH         unit health, for overheal / death recaps / boss %
---   POWER          mana / rage / energy of group members
+--   UNIT_DATA      health, power (with its type) and position of a unit, in one line
 --   UNIT_TARGET    target of the hostile units in combat (who is tanking)
---   UNIT_POSITION  world position of group members and hostile units
 --   RAID_MARK      raid target icons
 --   THREAT         server threat table of a mob (TWThreat API)
 --   THREAT_TANK    "mobs I am tanking" table (TWThreat tank mode API)
@@ -21,12 +19,11 @@
 -- =============================================================================
 
 local Octo = {
-    formatVersion = 1,
+    formatVersion = 2,
     hostiles = {},      -- [guid] = GetTime() of the last combat event involving it
-    lastHealth = {},    -- [guid] = last logged health
-    lastPower = {},     -- [guid .. ":" .. powerType] = last logged value
+    lastData = {},      -- [guid] = last UNIT_DATA written { hp, maxHp, power, maxPower, powerType, map, x, y, z }
+    dirty = {},         -- [guid] = unit token or GUID to snapshot at the end of the frame
     lastTarget = {},    -- [guid] = last logged target guid
-    lastPos = {},       -- [guid] = { x, y, z }
     marks = {},         -- [guid] = raid icon index
     lastThreat = {},    -- [mobGuid] = { list, time }
     lastQuery = 0,
@@ -48,8 +45,7 @@ local UDTS_TM = "TWT_UDTSv4_TM"
 
 -- Default settings (stored in ChronicleCompanionDB.advancedLog with an "octo_" prefix)
 local DEFAULTS = {
-    health = true,
-    power = true,
+    unitData = true,
     target = true,
     targetInterval = 0.25,
     position = true,
@@ -155,15 +151,25 @@ function Octo:DetectPositionApi()
     end
 end
 
---- Returns world x, y, z of a unit token or GUID, or nil.
+--- Returns world x, y, z of a unit token or GUID, plus the Map.dbc id when the
+--- API gives it (ClassicAPI), or nil.
 function Octo:Position(unit)
     if self.positionApi == "none" or not UnitPosition then return nil end
-    local ok, a, b, c = pcall(UnitPosition, unit)
+    local ok, a, b, c, d = pcall(UnitPosition, unit)
     if not ok or not a then return nil end
     if self.positionApi == "classicapi" then
-        return b, a, c
+        return b, a, c, d
     end
-    return a, b, c
+    return a, b, c, nil
+end
+
+--- Map.dbc id of the current map: ClassicAPI GetInstanceInfo, else nil.
+function Octo:CurrentMapId()
+    if GetInstanceInfo then
+        local ok, _, _, _, _, _, _, _, instanceID = pcall(GetInstanceInfo)
+        if ok and instanceID then return instanceID end
+    end
+    return nil
 end
 
 local function Round(value, decimals)
@@ -204,8 +210,7 @@ function Octo:Cleanup(now)
         if now - seen > HOSTILE_TTL then
             self.hostiles[guid] = nil
             self.lastTarget[guid] = nil
-            self.lastPos[guid] = nil
-            self.lastHealth[guid] = nil
+            self.lastData[guid] = nil
         end
     end
     for guid, data in pairs(self.lastThreat) do
@@ -215,10 +220,9 @@ end
 
 function Octo:Reset()
     self.hostiles = {}
-    self.lastHealth = {}
-    self.lastPower = {}
+    self.lastData = {}
+    self.dirty = {}
     self.lastTarget = {}
-    self.lastPos = {}
     self.marks = {}
     self.lastThreat = {}
 end
@@ -232,7 +236,8 @@ function Octo:WriteInfo()
     local classicApi = (C_NamePlate ~= nil or GetClassicExpansionLevel ~= nil) and 1 or 0
     local superWow = SUPERWOW_VERSION or ""
     local threat = self:ThreatQueryActive() and "query" or "listen"
-    ChronicleLog:Write("OCTO_INFO", self.formatVersion, self.positionApi, classicApi, superWow, threat)
+    self.mapId = self:CurrentMapId()
+    ChronicleLog:Write("OCTO_INFO", self.formatVersion, self.positionApi, classicApi, superWow, threat, self.mapId or "")
 end
 
 local originalWriteZoneInfo = ChronicleLog.WriteZoneInfo
@@ -256,8 +261,104 @@ function ChronicleLog:Enable()
 end
 
 -- =============================================================================
--- HEALTH / POWER (Nampower *_GUID events)
+-- UNIT_DATA: health, power and position of a unit on one line
+--   ts|UNIT_DATA|guid|hp|maxHp|power|maxPower|powerType|mapId|x|y|z
+-- Written right away on Nampower *_GUID events (health / mana / rage / energy
+-- change); the polls (hostile units, positions) mark units "dirty" and write
+-- them once at the end of the frame. A line is written only if something
+-- changed (position: more than positionMinMove yards).
 -- =============================================================================
+
+-- power type -> unit field holding the current value / max, and a divisor
+-- (rage is stored x10 in the unit field: 1000 = 100 rage)
+local POWER_FIELDS = {
+    [0] = { "power1", "maxPower1", 1 },   -- mana
+    [1] = { "power2", "maxPower2", 10 },  -- rage
+    [2] = { "power3", "maxPower3", 1 },   -- focus (hunter pets)
+    [3] = { "power4", "maxPower4", 1 },   -- energy
+    [4] = { "power5", "maxPower5", 1 },   -- happiness (hunter pets)
+}
+
+--- Power type from bytes0 (byte 3), falls back to UnitPowerType.
+local function PowerTypeOf(unit)
+    local bytes0 = SafeField(unit, "bytes0")
+    if bytes0 then
+        return math.mod(math.floor(bytes0 / 16777216), 256)
+    end
+    if UnitPowerType then
+        local ok, pt = pcall(UnitPowerType, unit)
+        if ok then return pt end
+    end
+    return nil
+end
+
+function Octo:MarkDirty(guid, unit)
+    if ValidGuid(guid) then
+        self.dirty[guid] = unit or guid
+    end
+end
+
+function Octo:Snapshot(guid, unit)
+    local hp = SafeField(unit, "health")
+    if not hp then return nil end
+    local data = { hp = hp, maxHp = SafeField(unit, "maxHealth") or "" }
+
+    local pt = PowerTypeOf(unit)
+    local spec = pt and POWER_FIELDS[pt]
+    if spec then
+        local value, max = SafeField(unit, spec[1]), SafeField(unit, spec[2])
+        if value then
+            data.powerType = pt
+            data.power = math.floor(value / spec[3])
+            data.maxPower = max and math.floor(max / spec[3]) or ""
+        end
+    end
+
+    if self:Get("position") then
+        local x, y, z, mapId = self:Position(unit)
+        if x then
+            data.x, data.y, data.z = Round(x, 2), Round(y, 2), Round(z, 2)
+            data.map = mapId
+        end
+    end
+    if not data.map then data.map = self.mapId end
+    return data
+end
+
+function Octo:Changed(old, new)
+    if not old then return true end
+    if old.hp ~= new.hp or old.maxHp ~= new.maxHp or old.power ~= new.power
+        or old.maxPower ~= new.maxPower or old.powerType ~= new.powerType or old.map ~= new.map then
+        return true
+    end
+    if new.x and not old.x then return true end
+    if new.x and old.x then
+        local minMove = tonumber(self:Get("positionMinMove")) or 0.5
+        local dx, dy, dz = new.x - old.x, new.y - old.y, new.z - old.z
+        if (dx * dx + dy * dy + dz * dz) >= minMove * minMove then return true end
+    end
+    return false
+end
+
+--- Takes a snapshot of one unit and writes UNIT_DATA if anything changed.
+function Octo:WriteUnitData(guid, unit)
+    local data = self:Snapshot(guid, unit)
+    if not data then return end
+    if not self:Changed(self.lastData[guid], data) then return end
+    self.lastData[guid] = data
+    ChronicleLog:CheckUnit(guid)
+    ChronicleLog:Write("UNIT_DATA", guid, data.hp, data.maxHp,
+        data.power or "", data.maxPower or "", data.powerType or "",
+        data.map or "", data.x or "", data.y or "", data.z or "")
+end
+
+--- Writes the units marked by the polls (at most one line per unit per frame).
+function Octo:FlushDirty()
+    for guid, unit in pairs(self.dirty) do
+        self:WriteUnitData(guid, unit)
+        self.dirty[guid] = nil
+    end
+end
 
 local function IsGrouped(isPlayer, isPet, partyIndex, raidIndex)
     return isPlayer == 1 or isPet == 1
@@ -265,48 +366,28 @@ local function IsGrouped(isPlayer, isPet, partyIndex, raidIndex)
         or (tonumber(raidIndex) or 0) > 0
 end
 
-function ChronicleLog:UNIT_HEALTH_GUID(guid, isPlayer, isTarget, isMouseover, isPet, partyIndex, raidIndex)
-    if not Octo:Get("health") or not ValidGuid(guid) then return end
-    if not IsGrouped(isPlayer, isPet, partyIndex, raidIndex) and not Octo:IsTracked(guid) then
-        return
+function Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
+    if not self:Get("unitData") or not ValidGuid(guid) then return end
+    if IsGrouped(isPlayer, isPet, partyIndex, raidIndex) or self:IsTracked(guid) then
+        -- written right away so the timestamp is the one of the event
+        self:WriteUnitData(guid, guid)
     end
-    local hp = SafeField(guid, "health")
-    if not hp then return end
-    if Octo.lastHealth[guid] == hp then return end
-    Octo.lastHealth[guid] = hp
-    self:CheckUnit(guid)
-    self:Write("HEALTH", guid, hp, SafeField(guid, "maxHealth") or "")
 end
 
-local POWER_FIELDS = {
-    UNIT_MANA_GUID = { field = "power1", max = "maxPower1", type = 0 },
-    UNIT_RAGE_GUID = { field = "power2", max = "maxPower2", type = 1 },
-    UNIT_ENERGY_GUID = { field = "power4", max = "maxPower4", type = 3 },
-}
-
-function Octo:Power(event, guid, isPlayer, isPet, partyIndex, raidIndex)
-    if not self:Get("power") or not ValidGuid(guid) then return end
-    if not IsGrouped(isPlayer, isPet, partyIndex, raidIndex) then return end
-    local spec = POWER_FIELDS[event]
-    local value = SafeField(guid, spec.field)
-    if not value then return end
-    local key = guid .. ":" .. spec.type
-    if self.lastPower[key] == value then return end
-    self.lastPower[key] = value
-    ChronicleLog:CheckUnit(guid)
-    ChronicleLog:Write("POWER", guid, spec.type, value, SafeField(guid, spec.max) or "")
+function ChronicleLog:UNIT_HEALTH_GUID(guid, isPlayer, isTarget, isMouseover, isPet, partyIndex, raidIndex)
+    Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
 end
 
 function ChronicleLog:UNIT_MANA_GUID(guid, isPlayer, isTarget, isMouseover, isPet, partyIndex, raidIndex)
-    Octo:Power("UNIT_MANA_GUID", guid, isPlayer, isPet, partyIndex, raidIndex)
+    Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
 end
 
 function ChronicleLog:UNIT_RAGE_GUID(guid, isPlayer, isTarget, isMouseover, isPet, partyIndex, raidIndex)
-    Octo:Power("UNIT_RAGE_GUID", guid, isPlayer, isPet, partyIndex, raidIndex)
+    Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
 end
 
 function ChronicleLog:UNIT_ENERGY_GUID(guid, isPlayer, isTarget, isMouseover, isPet, partyIndex, raidIndex)
-    Octo:Power("UNIT_ENERGY_GUID", guid, isPlayer, isPet, partyIndex, raidIndex)
+    Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
 end
 
 -- =============================================================================
@@ -319,14 +400,9 @@ function Octo:PollTargets()
         if self:IsTracked(guid) then
             count = count + 1
             if count > MAX_POLL_UNITS then return end
-            -- health too: UNIT_HEALTH_GUID may only fire for units bound to a token
-            if Octo:Get("health") then
-                local hp = SafeField(guid, "health")
-                if hp and self.lastHealth[guid] ~= hp then
-                    self.lastHealth[guid] = hp
-                    ChronicleLog:Write("HEALTH", guid, hp, SafeField(guid, "maxHealth") or "")
-                end
-            end
+            -- health / power too: the *_GUID events may only fire for units bound
+            -- to a token; the snapshot is written only if something changed
+            if self:Get("unitData") then self:MarkDirty(guid, guid) end
             local target = SafeField(guid, "target")
             if not ValidGuid(target) then target = "" end
             if self.lastTarget[guid] ~= target then
@@ -341,35 +417,23 @@ function Octo:PollTargets()
 end
 
 -- =============================================================================
--- UNIT_POSITION (polled, only while the player is in combat)
+-- Position poll (only while the player is in combat): marks units dirty, the
+-- UNIT_DATA snapshot is written if they moved more than positionMinMove
 -- =============================================================================
-
-function Octo:LogPosition(guid, unit, minMove)
-    local x, y, z = self:Position(unit)
-    if not x then return end
-    local last = self.lastPos[guid]
-    if last then
-        local dx, dy, dz = x - last[1], y - last[2], z - last[3]
-        if (dx * dx + dy * dy + dz * dz) < minMove * minMove then return end
-    end
-    self.lastPos[guid] = { x, y, z }
-    ChronicleLog:Write("UNIT_POSITION", guid, Round(x, 2), Round(y, 2), Round(z, 2))
-end
 
 function Octo:PollPositions()
     if self.positionApi == "none" or self.positionApi == "unknown" then return end
-    local minMove = tonumber(self:Get("positionMinMove")) or 0.5
     local tokens = GroupTokens()
     for i = 1, table.getn(tokens) do
         local guid = GuidOf(tokens[i])
-        if guid then self:LogPosition(guid, tokens[i], minMove) end
+        if guid then self:MarkDirty(guid, tokens[i]) end
     end
     local count = 0
     for guid in pairs(self.hostiles) do
         if self:IsTracked(guid) then
             count = count + 1
             if count > MAX_POLL_UNITS then return end
-            self:LogPosition(guid, guid, minMove)
+            self:MarkDirty(guid, guid)
         end
     end
 end
@@ -542,6 +606,12 @@ Octo.frame:SetScript("OnUpdate", function()
         Octo.lastQuery = now
         Octo:QueryThreat()
     end
+
+    if Octo:Get("unitData") then
+        Octo:FlushDirty()
+    else
+        Octo.dirty = {}
+    end
 end)
 
 -- New events (registered by ChronicleLog:Enable with the rest)
@@ -555,7 +625,7 @@ table.insert(ChronicleLog.events, "RAID_TARGET_UPDATE")
 -- Slash command: /chronicle octo [setting] [value]
 -- =============================================================================
 
-local BOOL_KEYS = { health = true, power = true, target = true, position = true, marks = true, threat = true }
+local BOOL_KEYS = { unitData = true, target = true, position = true, marks = true, threat = true }
 local NUM_KEYS = { targetInterval = true, positionInterval = true, positionMinMove = true, threatInterval = true, threatLimit = true }
 
 function Octo:Status()

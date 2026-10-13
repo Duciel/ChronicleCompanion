@@ -1,4 +1,4 @@
-# ChronicleCompanion — OctoWoW fork (0.38.0+octo1)
+# ChronicleCompanion — OctoWoW fork (0.38.0+octo2)
 
 This fork keeps everything ChronicleCompanion 0.38 writes, plus:
 
@@ -10,44 +10,59 @@ This fork keeps everything ChronicleCompanion 0.38 writes, plus:
 
 All lines keep the usual layout `TIMESTAMP_MS|EVENT|field|...`. The event names
 are new, so Chronicle skips them (checked with Chronicle's own parser on a real
-Onyxia log: 48 328 extra lines, 0 errors, identical results). No field of an
+Onyxia log with tens of thousands of extra lines, including UNIT_DATA: 0 errors,
+identical results). No field of an
 existing event was changed.
 
 ## Requirements
 
 | Feature | Needs |
 | --- | --- |
-| HEALTH, POWER, UNIT_TARGET | Nampower (already required) |
-| UNIT_POSITION | ClassicAPI (any visible unit) or SuperWoW (friendly units only) |
+| UNIT_DATA (health, power), UNIT_TARGET | Nampower (already required) |
+| UNIT_DATA position fields | ClassicAPI (any visible unit) or SuperWoW (friendly units only) |
 | RAID_MARK | nothing; `markN` tokens of ClassicAPI / SuperWoW make it more complete |
 | THREAT, THREAT_TANK | the OctoWoW server threat API; TWThreat or pfUI-ThreatPlates optional |
 
 ## Events
 
 ### OCTO_INFO
-`ts|OCTO_INFO|formatVersion|positionApi|classicApi|superWowVersion|threatMode`
+`ts|OCTO_INFO|formatVersion|positionApi|classicApi|superWowVersion|threatMode|mapId`
 
-Written when logging starts and after every ZONE_INFO.
+Written when logging starts and after every ZONE_INFO. `formatVersion` is 2
+since `UNIT_DATA` replaced `HEALTH`, `POWER` and `UNIT_POSITION`.
 - `positionApi`: `classicapi`, `superwow`, `unknown` or `none`.
 - `threatMode`: `query` (this addon asks the server) or `listen` (TWThreat /
   pfUI-ThreatPlates ask, this addon only records the answers).
 
-### HEALTH
-`ts|HEALTH|guid|health|maxHealth`
+### UNIT_DATA
+`ts|UNIT_DATA|guid|hp|maxHp|power|maxPower|powerType|mapId|x|y|z`
 
-Group members, their pets, and hostile creatures seen in combat events during
-the last 15 s. Written only when the value changes. Source: Nampower
-`UNIT_HEALTH_GUID` + `GetUnitField(guid, "health")`, and a poll of tracked
-hostiles every `targetInterval`.
+Health, power and position of one unit on one line, written only when one of
+them changes (position: a move of more than `positionMinMove` yards).
 
-Note: check `maxHealth` for creatures. If it is 100, the server sends a
-percentage instead of real hit points.
+| Field | Content |
+| --- | --- |
+| `hp`, `maxHp` | current and max health |
+| `power`, `maxPower` | current and max value of the unit's **current** power type |
+| `powerType` | `0` mana, `1` rage, `2` focus, `3` energy, `4` happiness |
+| `mapId` | `Map.dbc` id (ClassicAPI), e.g. 309 for Zul'Gurub; empty without ClassicAPI |
+| `x`, `y`, `z` | world coordinates in yards, x = north, y = west whatever the API |
 
-### POWER
-`ts|POWER|guid|powerType|value|max`
+Empty fields mean "not available" (no power, out of position range, etc.).
+Rage is converted to the usual 0–100 scale (the unit field stores ×10).
 
-Group members and pets only. `powerType`: 0 mana, 1 rage, 3 energy. Rage is the
-raw field value (×10: 1000 = 100 rage). Written only when the value changes.
+Units: group members, their pets, and hostile creatures seen in combat events
+during the last 15 s. Lines come from:
+- Nampower `UNIT_HEALTH_GUID` / `UNIT_MANA_GUID` / `UNIT_RAGE_GUID` /
+  `UNIT_ENERGY_GUID`, written right away (same timestamp as the event);
+- a poll of tracked hostiles every `targetInterval` (0.25 s);
+- a position poll every `positionInterval` (1 s), only while you are in combat.
+
+Notes:
+- A druid's power is the one of their current form: energy in cat form, rage
+  in bear form, mana otherwise. The caster mana is not visible while shifted.
+- Check `maxHp` for creatures. If it is 100, the server sends a percentage
+  instead of real hit points.
 
 ### UNIT_TARGET
 `ts|UNIT_TARGET|guid|targetGuid`
@@ -55,14 +70,6 @@ raw field value (×10: 1000 = 100 rage). Written only when the value changes.
 Target of each tracked hostile creature (empty = no target), polled every
 `targetInterval` (0.25 s), written on change. Gives who is tanking and when a
 boss switches target.
-
-### UNIT_POSITION
-`ts|UNIT_POSITION|guid|x|y|z`
-
-World coordinates (yards), normalised to x = north, y = west whatever the API.
-Group members and tracked hostiles, every `positionInterval` (1 s), only while
-you are in combat, and only when the unit moved more than `positionMinMove`
-(0.5 yd).
 
 ### RAID_MARK
 `ts|RAID_MARK|guid|index`
@@ -98,10 +105,11 @@ The same table received twice within 1.5 s is written once.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| health, power, target, position, marks, threat | on | turn each line type on/off |
-| targetInterval | 0.25 | seconds between target / hostile health polls |
+| unitData, target, marks, threat | on | turn each line type on/off |
+| position | on | add positions to `UNIT_DATA` and poll them in combat |
+| targetInterval | 0.25 | seconds between target / hostile health and power polls |
 | positionInterval | 1 | seconds between position polls (in combat) |
-| positionMinMove | 0.5 | yards before a new position is written |
+| positionMinMove | 0.5 | yards a unit must move before a position change alone writes a line |
 | threatQuery | auto | `auto`: ask the server only if TWThreat and pfUI-ThreatPlates are absent; `on`; `off` |
 | threatInterval | 1 | seconds between threat requests |
 | threatLimit | 10 | players per threat table requested |
@@ -112,5 +120,5 @@ The same table received twice within 1.5 s is written once.
   cover the whole raid.
 - The server only answers threat for **your** target. Shared relays from the
   group fill in the other mobs.
-- File size grows with HEALTH and UNIT_POSITION lines. Not measured yet in a
+- File size grows with UNIT_DATA lines. Not measured yet in a
   40-man raid: check the first log and raise the intervals if needed.
