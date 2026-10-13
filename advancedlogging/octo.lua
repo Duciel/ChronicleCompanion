@@ -2,7 +2,7 @@
 -- ChronicleLog Octo extensions
 --
 -- Extra log lines for deeper raid analysis on OctoWoW (1.12 client):
---   UNIT_DATA      health, power (with its type) and position of a unit, in one line
+--   UNIT_STATE      health, power (with its type) and position of a unit, in one line
 --   UNIT_TARGET    target of the hostile units in combat (who is tanking)
 --   RAID_MARK      raid target icons
 --   THREAT         server threat table of a mob (TWThreat API)
@@ -21,7 +21,7 @@
 local Octo = {
     formatVersion = 2,
     hostiles = {},      -- [guid] = GetTime() of the last combat event involving it
-    lastData = {},      -- [guid] = last UNIT_DATA written { hp, maxHp, power, maxPower, powerType, map, x, y, z }
+    lastData = {},      -- [guid] = last UNIT_STATE written { hp, maxHp, power, maxPower, powerType, map, x, y, z }
     dirty = {},         -- [guid] = unit token or GUID to snapshot at the end of the frame
     lastTarget = {},    -- [guid] = last logged target guid
     marks = {},         -- [guid] = raid icon index
@@ -45,7 +45,7 @@ local UDTS_TM = "TWT_UDTSv4_TM"
 
 -- Default settings (stored in ChronicleCompanionDB.advancedLog with an "octo_" prefix)
 local DEFAULTS = {
-    unitData = true,
+    unitState = true,
     target = true,
     targetInterval = 0.25,
     position = true,
@@ -261,8 +261,8 @@ function ChronicleLog:Enable()
 end
 
 -- =============================================================================
--- UNIT_DATA: health, power and position of a unit on one line
---   ts|UNIT_DATA|guid|hp|maxHp|power|maxPower|powerType|mapId|x|y|z
+-- UNIT_STATE: health, power and position of a unit on one line
+--   ts|UNIT_STATE|guid|hp|maxHp|power|maxPower|powerType|mapId|x|y|z
 -- Written right away on Nampower *_GUID events (health / mana / rage / energy
 -- change); the polls (hostile units, positions) mark units "dirty" and write
 -- them once at the end of the frame. A line is written only if something
@@ -340,14 +340,14 @@ function Octo:Changed(old, new)
     return false
 end
 
---- Takes a snapshot of one unit and writes UNIT_DATA if anything changed.
-function Octo:WriteUnitData(guid, unit)
+--- Takes a snapshot of one unit and writes UNIT_STATE if anything changed.
+function Octo:WriteUnitState(guid, unit)
     local data = self:Snapshot(guid, unit)
     if not data then return end
     if not self:Changed(self.lastData[guid], data) then return end
     self.lastData[guid] = data
     ChronicleLog:CheckUnit(guid)
-    ChronicleLog:Write("UNIT_DATA", guid, data.hp, data.maxHp,
+    ChronicleLog:Write("UNIT_STATE", guid, data.hp, data.maxHp,
         data.power or "", data.maxPower or "", data.powerType or "",
         data.map or "", data.x or "", data.y or "", data.z or "")
 end
@@ -355,7 +355,7 @@ end
 --- Writes the units marked by the polls (at most one line per unit per frame).
 function Octo:FlushDirty()
     for guid, unit in pairs(self.dirty) do
-        self:WriteUnitData(guid, unit)
+        self:WriteUnitState(guid, unit)
         self.dirty[guid] = nil
     end
 end
@@ -367,10 +367,10 @@ local function IsGrouped(isPlayer, isPet, partyIndex, raidIndex)
 end
 
 function Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
-    if not self:Get("unitData") or not ValidGuid(guid) then return end
+    if not self:Get("unitState") or not ValidGuid(guid) then return end
     if IsGrouped(isPlayer, isPet, partyIndex, raidIndex) or self:IsTracked(guid) then
         -- written right away so the timestamp is the one of the event
-        self:WriteUnitData(guid, guid)
+        self:WriteUnitState(guid, guid)
     end
 end
 
@@ -402,7 +402,7 @@ function Octo:PollTargets()
             if count > MAX_POLL_UNITS then return end
             -- health / power too: the *_GUID events may only fire for units bound
             -- to a token; the snapshot is written only if something changed
-            if self:Get("unitData") then self:MarkDirty(guid, guid) end
+            if self:Get("unitState") then self:MarkDirty(guid, guid) end
             local target = SafeField(guid, "target")
             if not ValidGuid(target) then target = "" end
             if self.lastTarget[guid] ~= target then
@@ -418,7 +418,7 @@ end
 
 -- =============================================================================
 -- Position poll (only while the player is in combat): marks units dirty, the
--- UNIT_DATA snapshot is written if they moved more than positionMinMove
+-- UNIT_STATE snapshot is written if they moved more than positionMinMove
 -- =============================================================================
 
 function Octo:PollPositions()
@@ -607,7 +607,7 @@ Octo.frame:SetScript("OnUpdate", function()
         Octo:QueryThreat()
     end
 
-    if Octo:Get("unitData") then
+    if Octo:Get("unitState") then
         Octo:FlushDirty()
     else
         Octo.dirty = {}
@@ -625,7 +625,7 @@ table.insert(ChronicleLog.events, "RAID_TARGET_UPDATE")
 -- Slash command: /chronicle octo [setting] [value]
 -- =============================================================================
 
-local BOOL_KEYS = { unitData = true, target = true, position = true, marks = true, threat = true }
+local BOOL_KEYS = { unitState = true, target = true, position = true, marks = true, threat = true }
 local NUM_KEYS = { targetInterval = true, positionInterval = true, positionMinMove = true, threatInterval = true, threatLimit = true }
 
 function Octo:Status()

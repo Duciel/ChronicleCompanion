@@ -10,7 +10,7 @@ This fork keeps everything ChronicleCompanion 0.38 writes, plus:
 
 All lines keep the usual layout `TIMESTAMP_MS|EVENT|field|...`. The event names
 are new, so Chronicle skips them (checked with Chronicle's own parser on a real
-Onyxia log with tens of thousands of extra lines, including UNIT_DATA: 0 errors,
+Onyxia log with tens of thousands of extra lines, including UNIT_STATE: 0 errors,
 identical results). No field of an
 existing event was changed.
 
@@ -18,8 +18,8 @@ existing event was changed.
 
 | Feature | Needs |
 | --- | --- |
-| UNIT_DATA (health, power), UNIT_TARGET | Nampower (already required) |
-| UNIT_DATA position fields | ClassicAPI (any visible unit) or SuperWoW (friendly units only) |
+| UNIT_STATE (health, power), UNIT_TARGET | Nampower (already required) |
+| UNIT_STATE position fields | ClassicAPI (any visible unit) or SuperWoW (friendly units only) |
 | RAID_MARK | nothing; `markN` tokens of ClassicAPI / SuperWoW make it more complete |
 | THREAT, THREAT_TANK | the OctoWoW server threat API; TWThreat or pfUI-ThreatPlates optional |
 
@@ -29,13 +29,13 @@ existing event was changed.
 `ts|OCTO_INFO|formatVersion|positionApi|classicApi|superWowVersion|threatMode|mapId`
 
 Written when logging starts and after every ZONE_INFO. `formatVersion` is 2
-since `UNIT_DATA` replaced `HEALTH`, `POWER` and `UNIT_POSITION`.
+since `UNIT_STATE` replaced `HEALTH`, `POWER` and `UNIT_POSITION`.
 - `positionApi`: `classicapi`, `superwow`, `unknown` or `none`.
 - `threatMode`: `query` (this addon asks the server) or `listen` (TWThreat /
   pfUI-ThreatPlates ask, this addon only records the answers).
 
-### UNIT_DATA
-`ts|UNIT_DATA|guid|hp|maxHp|power|maxPower|powerType|mapId|x|y|z`
+### UNIT_STATE
+`ts|UNIT_STATE|guid|hp|maxHp|power|maxPower|powerType|mapId|x|y|z`
 
 Health, power and position of one unit on one line, written only when one of
 them changes (position: a move of more than `positionMinMove` yards).
@@ -105,8 +105,8 @@ The same table received twice within 1.5 s is written once.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| unitData, target, marks, threat | on | turn each line type on/off |
-| position | on | add positions to `UNIT_DATA` and poll them in combat |
+| unitState, target, marks, threat | on | turn each line type on/off |
+| position | on | add positions to `UNIT_STATE` and poll them in combat |
 | targetInterval | 0.25 | seconds between target / hostile health and power polls |
 | positionInterval | 1 | seconds between position polls (in combat) |
 | positionMinMove | 0.5 | yards a unit must move before a position change alone writes a line |
@@ -120,5 +120,5 @@ The same table received twice within 1.5 s is written once.
   cover the whole raid.
 - The server only answers threat for **your** target. Shared relays from the
   group fill in the other mobs.
-- File size grows with UNIT_DATA lines. Not measured yet in a
+- File size grows with UNIT_STATE lines. Not measured yet in a
   40-man raid: check the first log and raise the intervals if needed.
