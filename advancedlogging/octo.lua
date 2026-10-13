@@ -25,6 +25,8 @@ local Octo = {
     dirty = {},         -- [guid] = unit token or GUID to snapshot at the end of the frame
     lastTarget = {},    -- [guid] = last logged target guid
     marks = {},         -- [guid] = raid icon index
+    missingMarks = {},  -- [guid] = consecutive scans the mark was not seen in
+    markScanAt = nil,   -- pending scan after RAID_TARGET_UPDATE
     lastThreat = {},    -- [mobGuid] = { list, time }
     lastQuery = 0,
     lastTargetPoll = 0,
@@ -224,6 +226,8 @@ function Octo:Reset()
     self.dirty = {}
     self.lastTarget = {}
     self.marks = {}
+    self.missingMarks = {}
+    self.markScanAt = nil
     self.lastThreat = {}
 end
 
@@ -317,7 +321,7 @@ function Octo:Snapshot(guid, unit)
     if self:Get("position") then
         local x, y, z, mapId = self:Position(unit)
         if x then
-            data.x, data.y, data.z = Round(x, 2), Round(y, 2), Round(z, 2)
+            data.x, data.y, data.z = Round(x, 1), Round(y, 1), Round(z, 1)
             data.map = mapId
         end
     end
@@ -462,30 +466,86 @@ function Octo:ScanMarks()
             end
         end
     end
+    local used = {}
     for guid, index in pairs(current) do
+        used[index] = guid
+        self.missingMarks[guid] = nil
         if self.marks[guid] ~= index then
             ChronicleLog:CheckUnit(guid)
             ChronicleLog:Write("RAID_MARK", guid, index)
         end
     end
-    for guid in pairs(self.marks) do
+    -- A unit can briefly drop out of a scan (seen in game: set / removed / set
+    -- within the same millisecond). A removal is written when the icon is now on
+    -- another unit, or when the unit is missing from two scans in a row.
+    for guid, index in pairs(self.marks) do
         if not current[guid] then
-            ChronicleLog:Write("RAID_MARK", guid, 0)
+            local misses = (self.missingMarks[guid] or 0) + 1
+            if (used[index] and used[index] ~= guid) or misses >= 2 then
+                self.missingMarks[guid] = nil
+                ChronicleLog:Write("RAID_MARK", guid, 0)
+            else
+                self.missingMarks[guid] = misses
+                current[guid] = index
+            end
         end
     end
     self.marks = current
 end
 
+-- RAID_TARGET_UPDATE comes in bursts: one scan 0.3 s after the last one
 function ChronicleLog:RAID_TARGET_UPDATE()
-    Octo:ScanMarks()
+    Octo.markScanAt = GetTime() + 0.3
 end
 
 -- =============================================================================
 -- THREAT (TWThreat server API, also relayed by TWThreat / pfUI-ThreatPlates)
 -- =============================================================================
 
+--- Rounds the percentage (4th field of every entry) of a threat list to one
+--- decimal: "Koniz:1:157:100.000000:0;" -> "Koniz:1:157:100:0;".
+--- Works for TWTv4 / TWTRelayV2 (name:tank:threat:perc:melee) and
+--- TMTv1 / PFTPTankV1 (creature:guid:player:perc) lists.
+local function RoundThreatList(list)
+    local out = {}
+    local from = 1
+    local len = strlen(list)
+    while from <= len do
+        local sep = strfind(list, ";", from, true)
+        local entry = strsub(list, from, (sep or (len + 1)) - 1)
+        local fields = {}
+        local f = 1
+        while true do
+            local c = strfind(entry, ":", f, true)
+            if not c then
+                table.insert(fields, strsub(entry, f))
+                break
+            end
+            table.insert(fields, strsub(entry, f, c - 1))
+            f = c + 1
+        end
+        local perc = tonumber(fields[4] or "")
+        if perc then
+            fields[4] = tostring(math.floor(perc * 10 + 0.5) / 10)
+        end
+        table.insert(out, table.concat(fields, ":"))
+        if not sep then break end
+        table.insert(out, ";")
+        from = sep + 1
+        if from > len then break end
+    end
+    -- keep a trailing ";" when the source had one
+    local result = table.concat(out, "")
+    if strsub(list, len, len) == ";" and strsub(result, -1) ~= ";" then
+        result = result .. ";"
+    end
+    return result
+end
+Octo.RoundThreatList = RoundThreatList
+
 function Octo:WriteThreat(mobGuid, mobName, source, list)
     if not list or list == "" then return end
+    list = RoundThreatList(list)
     local key = mobGuid ~= "" and mobGuid or ("name:" .. (mobName or ""))
     local now = GetTime()
     local last = self.lastThreat[key]
@@ -517,7 +577,7 @@ function Octo:HandleServerThreat(message)
         if te then
             local list = strsub(tankPart, te + 1)
             if list ~= "" then
-                ChronicleLog:Write("THREAT_TANK", "self", list)
+                ChronicleLog:Write("THREAT_TANK", "self", RoundThreatList(list))
             end
         end
     end
@@ -552,7 +612,7 @@ function ChronicleLog:CHAT_MSG_ADDON(prefix, message, channel, sender)
             if strsub(message, 1, strlen(TANKSHARE_API)) == TANKSHARE_API then
                 local list = strsub(message, strlen(TANKSHARE_API) + 1)
                 if list ~= "" then
-                    self:Write("THREAT_TANK", "relay:" .. sender, list)
+                    self:Write("THREAT_TANK", "relay:" .. sender, RoundThreatList(list))
                 end
                 return
             end
@@ -596,6 +656,11 @@ Octo.frame:SetScript("OnUpdate", function()
     end
 
     -- RAID_TARGET_UPDATE has no payload and can fire before units are known
+    if Octo.markScanAt and now >= Octo.markScanAt then
+        Octo.markScanAt = nil
+        Octo.lastMarkPoll = now
+        Octo:ScanMarks()
+    end
     if inCombat and Octo:Get("marks") and now - Octo.lastMarkPoll >= 5 then
         Octo.lastMarkPoll = now
         Octo:ScanMarks()

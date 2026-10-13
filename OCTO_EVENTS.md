@@ -1,4 +1,4 @@
-# ChronicleCompanion — OctoWoW fork (0.38.1)
+# ChronicleCompanion — OctoWoW fork (0.38.2)
 
 This fork keeps everything ChronicleCompanion 0.38 writes, plus:
 
@@ -46,7 +46,7 @@ them changes (position: a move of more than `positionMinMove` yards).
 | `power`, `maxPower` | current and max value of the unit's **current** power type |
 | `powerType` | `0` mana, `1` rage, `2` focus, `3` energy, `4` happiness |
 | `mapId` | `Map.dbc` id (ClassicAPI), e.g. 309 for Zul'Gurub; empty without ClassicAPI |
-| `x`, `y`, `z` | world coordinates in yards, x = north, y = west whatever the API |
+| `x`, `y`, `z` | world coordinates in yards (1 decimal), x = north, y = west whatever the API |
 
 Empty fields mean "not available" (no power, out of position range, etc.).
 Rage is converted to the usual 0–100 scale (the unit field stores ×10).
@@ -74,15 +74,17 @@ boss switches target.
 ### RAID_MARK
 `ts|RAID_MARK|guid|index`
 
-Raid icon 1–8 set on a unit, `0` when removed. On `RAID_TARGET_UPDATE`, on
-enable, and every 5 s in combat.
+Raid icon 1–8 set on a unit, `0` when removed. Scanned 0.3 s after the last
+`RAID_TARGET_UPDATE` of a burst, on enable, and every 5 s in combat. A removal
+is written when the icon moves to another unit, or when the unit is missing
+from two scans in a row (a single scan can miss a mark for a moment).
 
 ### THREAT
 `ts|THREAT|mobGuid|mobName|source|list`
 
-Server threat table of one mob. `list` is copied as received:
-`player:tank:threat:perc:melee;...` (`tank`/`melee` = 1 or 0, `perc` = % of
-the tank's threat). `source`:
+Server threat table of one mob: `player:tank:threat:perc:melee;...`
+(`tank`/`melee` = 1 or 0, `perc` = % of the tank's threat, rounded to 1
+decimal: the server sends `100.000000`). `source`:
 - `self`: answer to a `TWT_UDTSv4_TM` request from this client (this addon,
   TWThreat or pfUI-ThreatPlates). `mobGuid` is your target when the answer
   arrived.
@@ -95,7 +97,8 @@ The same table received twice within 1.5 s is written once.
 ### THREAT_TANK
 `ts|THREAT_TANK|source|list`
 
-"Mobs I am tanking" list: `creature:serverGuid:nextPlayer:perc;...`.
+"Mobs I am tanking" list: `creature:serverGuid:nextPlayer:perc;...` (`perc`
+rounded to 1 decimal).
 `source` is `self` (TMTv1 answer) or `relay:<Tank>` (`PFTPTankV1` share).
 `serverGuid` is the server's decimal form, not the `0x…` form.
 
