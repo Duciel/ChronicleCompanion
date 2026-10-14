@@ -7,7 +7,6 @@
 --   RAID_MARK      raid target icons
 --   THREAT         server threat table of a mob (TWThreat API)
 --   THREAT_TANK    "mobs I am tanking" table (TWThreat tank mode API)
---   OCTO_INFO      format version and the client APIs that were available
 --
 -- Every line uses the usual TIMESTAMP|EVENT|field|... layout with event names
 -- Chronicle does not know: Chronicle skips them, the separate analysis tool
@@ -232,16 +231,13 @@ function Octo:Reset()
 end
 
 -- =============================================================================
--- OCTO_INFO
+-- Session state: client APIs and map id are written by core.lua in HEADER
+-- (superWowVersion, classicApi, threatMode) and ZONE_INFO (mapId)
 -- =============================================================================
 
 function Octo:WriteInfo()
     self:DetectPositionApi()
-    local classicApi = (C_NamePlate ~= nil or GetClassicExpansionLevel ~= nil) and 1 or 0
-    local superWow = SUPERWOW_VERSION or ""
-    local threat = self:ThreatQueryActive() and "query" or "listen"
     self.mapId = self:CurrentMapId()
-    ChronicleLog:Write("OCTO_INFO", self.formatVersion, self.positionApi, classicApi, superWow, threat, self.mapId or "")
 end
 
 local originalWriteZoneInfo = ChronicleLog.WriteZoneInfo

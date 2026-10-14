@@ -1,4 +1,4 @@
-# ChronicleCompanion — OctoWoW fork (0.38.2)
+# ChronicleCompanion — OctoWoW fork (0.38.3)
 
 This fork keeps everything ChronicleCompanion 0.38 writes, plus:
 
@@ -25,14 +25,24 @@ existing event was changed.
 
 ## Events
 
-### OCTO_INFO
-`ts|OCTO_INFO|formatVersion|positionApi|classicApi|superWowVersion|threatMode|mapId`
+### HEADER and ZONE_INFO (existing lines, extra fields)
+`0|HEADER|playerGuid|realm|zone|addonVer|superWowVer|namPowerVer|xp3Ver|wowVer|wowBuild|wowBuildDate|localTime|utcTime|combatLogRange|classicApi|threatMode`
 
-Written when logging starts and after every ZONE_INFO. `formatVersion` is 2
-since `UNIT_STATE` replaced `HEALTH`, `POWER` and `UNIT_POSITION`.
-- `positionApi`: `classicapi`, `superwow`, `unknown` or `none`.
-- `threatMode`: `query` (this addon asks the server) or `listen` (TWThreat /
-  pfUI-ThreatPlates ask, this addon only records the answers).
+- `superWowVer`: the existing slot is filled again with `SUPERWOW_VERSION`
+  (empty without SuperWoW).
+- `classicApi` (new, at the end): `1` when ClassicAPI is loaded, `0` otherwise.
+- `threatMode` (new, at the end): `query` (this addon asks the server),
+  `listen` (TWThreat / pfUI-ThreatPlates ask, this addon records the answers)
+  or empty when threat logging is off.
+
+`ts|ZONE_INFO|zoneName|mapId|inInstance|instanceType|isGhost`
+
+- `mapId`: the existing empty slot after the zone name now holds the
+  `Map.dbc` id (ClassicAPI `GetInstanceInfo`), e.g. 309 for Zul'Gurub; empty
+  without ClassicAPI.
+
+These replace the `OCTO_INFO` line of earlier fork versions, as suggested by
+the ChronicleCompanion author.
 
 ### UNIT_STATE
 `ts|UNIT_STATE|guid|hp|maxHp|power|maxPower|powerType|mapId|x|y|z`
@@ -45,7 +55,7 @@ them changes (position: a move of more than `positionMinMove` yards).
 | `hp`, `maxHp` | current and max health |
 | `power`, `maxPower` | current and max value of the unit's **current** power type |
 | `powerType` | `0` mana, `1` rage, `2` focus, `3` energy, `4` happiness |
-| `mapId` | `Map.dbc` id (ClassicAPI), e.g. 309 for Zul'Gurub; empty without ClassicAPI |
+| `mapId` | `Map.dbc` id (ClassicAPI), e.g. 309 for Zul'Gurub; empty without ClassicAPI (same value as in `ZONE_INFO`) |
 | `x`, `y`, `z` | world coordinates in yards (1 decimal), x = north, y = west whatever the API |
 
 Empty fields mean "not available" (no power, out of position range, etc.).

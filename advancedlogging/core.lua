@@ -388,7 +388,10 @@ end
 -- =============================================================================
 
 --- Generates a header string with player and version metadata.
---- Format: HEADER|playerGuid|realm|zone|addonVer|superWowVer|namPowerVer|xp3Ver|wowVer|wowBuild|wowBuildDate|localTime|utcTime|combatLogRange|clientType
+--- Format: HEADER|playerGuid|realm|zone|addonVer|superWowVer|namPowerVer|xp3Ver|wowVer|wowBuild|wowBuildDate|localTime|utcTime|combatLogRange|classicApi|threatMode
+--- classicApi: 1 when the ClassicAPI DLL is loaded, 0 otherwise.
+--- threatMode: "query" (this addon asks the server for threat), "listen" (another
+--- threat addon asks, this addon records the answers) or "" (threat logging off).
 ---@return string header Pipe-delimited header line
 function ChronicleLog:GenerateHeader()
     -- Player info
@@ -399,7 +402,7 @@ function ChronicleLog:GenerateHeader()
     
     -- Addon versions
     local addonVersion = GetAddOnMetadata("ChronicleCompanion", "Version") or ""
-    local superWowVersion = ""
+    local superWowVersion = SUPERWOW_VERSION or ""
     local namPowerVersion = NAMPOWER_VERSION or ""
     
     local xp3Version = ""
@@ -417,6 +420,13 @@ function ChronicleLog:GenerateHeader()
     
     -- Combat log range
     local combatLogRange = GetCVar("CombatLogRangeCreature") or ""
+
+    -- Client mods and threat logging mode (see advancedlogging/octo.lua)
+    local classicApi = (C_NamePlate ~= nil or GetClassicExpansionLevel ~= nil) and 1 or 0
+    local threatMode = ""
+    if ChronicleOcto and ChronicleOcto:Get("threat") then
+        threatMode = ChronicleOcto:ThreatQueryActive() and "query" or "listen"
+    end
     
     local parts = {
         "HEADER",
@@ -432,7 +442,9 @@ function ChronicleLog:GenerateHeader()
         wowBuildDate,
         localTime,
         utcTime,
-        combatLogRange
+        combatLogRange,
+        classicApi,
+        threatMode
     }
     
     return table.concat(parts, LOG_SEP)
@@ -830,8 +842,14 @@ function ChronicleLog:WriteZoneInfo(force)
     end
     
     self:WriteHeader()
-    -- The value after zoneName is the mapID, not the instance ID
-    self:Write("ZONE_INFO", zoneName, "", inInstanceNum, instanceType, isGhost)
+    -- The value after zoneName is the mapID (Map.dbc id), not the instance ID.
+    -- Only ClassicAPI exposes it (GetInstanceInfo, 8th value); empty otherwise.
+    local mapId = ""
+    if GetInstanceInfo then
+        local ok, _, _, _, _, _, _, _, id = pcall(GetInstanceInfo)
+        if ok and id then mapId = id end
+    end
+    self:Write("ZONE_INFO", zoneName, mapId, inInstanceNum, instanceType, isGhost)
 end
 
 --- Updates the saved instance ID for the current zone.
