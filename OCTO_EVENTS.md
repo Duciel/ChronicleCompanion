@@ -1,4 +1,4 @@
-# ChronicleCompanion — OctoWoW fork (0.38.3)
+# ChronicleCompanion — OctoWoW fork (0.38.4)
 
 This fork keeps everything ChronicleCompanion 0.38 writes, plus:
 
@@ -30,16 +30,19 @@ existing event was changed.
 
 - `superWowVer`: the existing slot is filled again with `SUPERWOW_VERSION`
   (empty without SuperWoW).
-- `classicApi` (new, at the end): `1` when ClassicAPI is loaded, `0` otherwise.
+- `classicApi` (new, at the end): ClassicAPI version `X.Y.Z`, decoded from
+  `CLASSIC_API_VERSION` (major × 10000 + minor × 100 + patch); empty when
+  ClassicAPI is not loaded, `unknown` for a build without that global.
 - `threatMode` (new, at the end): `query` (this addon asks the server),
   `listen` (TWThreat / pfUI-ThreatPlates ask, this addon records the answers)
   or empty when threat logging is off.
 
-`ts|ZONE_INFO|zoneName|mapId|inInstance|instanceType|isGhost`
+`ts|ZONE_INFO|zoneName||inInstance|instanceType|isGhost|mapId`
 
-- `mapId`: the existing empty slot after the zone name now holds the
-  `Map.dbc` id (ClassicAPI `GetInstanceInfo`), e.g. 309 for Zul'Gurub; empty
-  without ClassicAPI.
+- The slot after the zone name stays empty: Chronicle uses it as an internal
+  instance number.
+- `mapId` (new, at the end): the `Map.dbc` id (ClassicAPI `GetInstanceInfo`),
+  e.g. 309 for Zul'Gurub; empty without ClassicAPI.
 
 These replace the `OCTO_INFO` line of earlier fork versions, as suggested by
 the ChronicleCompanion author.

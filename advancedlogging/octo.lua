@@ -852,7 +852,8 @@ function Octo:RefreshOptions()
     end
 
     self:DetectPositionApi()
-    local classicApi = (C_NamePlate ~= nil or GetClassicExpansionLevel ~= nil) and "yes" or "no"
+    local classicApi = Chronicle_ClassicAPIVersion()
+    if classicApi == "" then classicApi = "no" end
     side.apiText:SetText("Positions: " .. self.positionApi .. "\nClassicAPI: " .. classicApi
         .. "\nSuperWoW: " .. (SUPERWOW_VERSION or "no")
         .. "\nNampower fields: " .. (GetUnitField and "yes" or "no"))
