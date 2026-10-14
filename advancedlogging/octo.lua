@@ -98,19 +98,36 @@ local function GuidOf(unit)
     return nil
 end
 
+-- PERF (local change): unit tokens are built once; GroupTokens() returns a shared
+-- list (read-only for callers) rebuilt only when the group size changes.
+local RAID_TOKENS, RAID_TARGET_TOKENS = {}, {}
+for i = 1, 40 do
+    RAID_TOKENS[i] = "raid" .. i
+    RAID_TARGET_TOKENS["raid" .. i] = "raid" .. i .. "target"
+end
+local PARTY_TOKENS = { "party1", "party2", "party3", "party4" }
+RAID_TARGET_TOKENS["player"] = "playertarget"
+for i = 1, 4 do RAID_TARGET_TOKENS["party" .. i] = "party" .. i .. "target" end
+local groupTokens, groupTokensKey = {}, nil
+
 local function GroupTokens()
-    local tokens = {}
     local raid = GetNumRaidMembers() or 0
+    local party = GetNumPartyMembers() or 0
+    local key = raid > 0 and raid or -party - 1
+    if key == groupTokensKey then return groupTokens end
+    groupTokensKey = key
+    local tokens = {}
     if raid > 0 then
         for i = 1, raid do
-            table.insert(tokens, "raid" .. i)
+            tokens[i] = RAID_TOKENS[i] or ("raid" .. i)
         end
     else
-        table.insert(tokens, "player")
-        for i = 1, (GetNumPartyMembers() or 0) do
-            table.insert(tokens, "party" .. i)
+        tokens[1] = "player"
+        for i = 1, party do
+            table.insert(tokens, PARTY_TOKENS[i] or ("party" .. i))
         end
     end
+    groupTokens = tokens
     return tokens
 end
 
@@ -298,10 +315,19 @@ function Octo:MarkDirty(guid, unit)
     end
 end
 
+-- PERF (local change): the snapshot is taken into one reused scratch table; a
+-- unit's lastData table is only created/updated when something changed.
+local scratch = {}
+local SNAP_FIELDS = { "hp", "maxHp", "powerType", "power", "maxPower", "x", "y", "z", "map" }
+local NSNAP = 9
+
 function Octo:Snapshot(guid, unit)
     local hp = SafeField(unit, "health")
     if not hp then return nil end
-    local data = { hp = hp, maxHp = SafeField(unit, "maxHealth") or "" }
+    local data = scratch
+    for i = 1, NSNAP do data[SNAP_FIELDS[i]] = nil end
+    data.hp = hp
+    data.maxHp = SafeField(unit, "maxHealth") or ""
 
     local pt = PowerTypeOf(unit)
     local spec = pt and POWER_FIELDS[pt]
@@ -344,8 +370,16 @@ end
 function Octo:WriteUnitState(guid, unit)
     local data = self:Snapshot(guid, unit)
     if not data then return end
-    if not self:Changed(self.lastData[guid], data) then return end
-    self.lastData[guid] = data
+    local old = self.lastData[guid]
+    if not self:Changed(old, data) then return end
+    -- keep a copy of the scratch snapshot (reusing the unit's previous table)
+    local keep = old or {}
+    for i = 1, NSNAP do
+        local k = SNAP_FIELDS[i]
+        keep[k] = data[k]
+    end
+    self.lastData[guid] = keep
+    data = keep
     ChronicleLog:CheckUnit(guid)
     ChronicleLog:Write("UNIT_STATE", guid, data.hp, data.maxHp,
         data.power or "", data.maxPower or "", data.powerType or "",
@@ -453,13 +487,14 @@ function Octo:ScanMarks()
     -- plain 1.12 fallback: group members and their targets
     local tokens = GroupTokens()
     for i = 1, table.getn(tokens) do
-        local units = { tokens[i], tokens[i] .. "target" }
+        local unit = tokens[i]
         for j = 1, 2 do
-            local guid = GuidOf(units[j])
+            local guid = GuidOf(unit)
             if guid and not current[guid] then
-                local index = GetRaidTargetIndex(units[j])
+                local index = GetRaidTargetIndex(unit)
                 if index then current[guid] = index end
             end
+            unit = RAID_TARGET_TOKENS[unit] or (unit .. "target")
         end
     end
     local used = {}

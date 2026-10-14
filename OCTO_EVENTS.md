@@ -1,4 +1,4 @@
-# ChronicleCompanion — OctoWoW fork (0.38.4)
+# ChronicleCompanion — OctoWoW fork (0.38.5)
 
 This fork keeps everything ChronicleCompanion 0.38 writes, plus:
 

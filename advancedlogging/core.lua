@@ -27,7 +27,7 @@ ChronicleLog.isTurtleWow = (tonumber(wowBuild) == 7272)
 -- Delimiter for log output format: TIMESTAMP|EVENT_TYPE|field1|field2|...
 local LOG_SEP = "|"
 
--- PERF: lines written per frame by a deferred combat-end save
+-- PERF (local change): lines written per frame by a deferred combat-end save
 local FLUSH_CHUNK_LINES = 1000
 
 local RAID_GROUP_DEBOUNCE_DELAY = 0.25
@@ -255,7 +255,7 @@ function ChronicleLog:Init()
     local lastTransmogCheck = 0
     self.frame:SetScript("OnUpdate", function()
         local now = GetTime()
-        -- PERF: write a deferred combat-end save a few lines per frame
+        -- PERF (local change): write a deferred combat-end save a few lines per frame
         if ChronicleLog.pendingFlush then
             ChronicleLog:DrainPendingFlush(FLUSH_CHUNK_LINES)
         end
@@ -282,7 +282,7 @@ function ChronicleLog:Init()
         if event == "PLAYER_ENTERING_WORLD" then
             ChronicleLog:FlushToFile()
         elseif autoSave then
-            -- PERF: spread over the next frames instead of one freeze
+            -- PERF (local change): spread over the next frames instead of one freeze
             ChronicleLog:FlushToFile(true)
         end
 
@@ -463,7 +463,7 @@ end
 --- Uses Lua 5.0 vararg style (arg table) for Vanilla WoW compatibility.
 --- Buffer is written to file when logging is disabled via ChronicleLog:Disable().
 ---@param eventType string Event type code (SWING, CAST, DEATH, COMBAT_START, COMBAT_END, RAW)
--- PERF: one reused table assembles every line (was a new table per line)
+-- PERF (local change): one reused table assembles every line (was a new table per line)
 local writeParts = {}
 
 function ChronicleLog:Write(eventType, ...)
@@ -501,7 +501,7 @@ end
 --- Appends to existing file content using native append mode.
 --- Filename: see ChronicleLog:GetLogFilename()
 ---@return number linesWritten Number of new lines written
--- PERF: the file content is exactly the same as before, but
+-- PERF (local change): the file content is exactly the same as before, but
 --   * the header and the lines are appended separately instead of building
 --     header .. "\n" .. content .. "\n" (two extra copies of the whole buffer);
 --   * a combat-end auto save (deferred = true) hands the buffer to a background
