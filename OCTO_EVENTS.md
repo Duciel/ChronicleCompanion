@@ -13,7 +13,7 @@ identical results). Existing events are unchanged, except `HEADER` and
 
 | Feature | Needs |
 | --- | --- |
-| UNIT_STATE (health, power), UNIT_TARGET | Nampower (already required) |
+| UNIT_STATE (health, power), UNIT_TARGET, UNIT_COMBAT | Nampower (already required) |
 | UNIT_STATE position fields | ClassicAPI (any visible unit) or SuperWoW (friendly units only) |
 | RAID_MARK | nothing; `markN` tokens of ClassicAPI / SuperWoW make it more complete |
 | THREAT, THREAT_TANK | the OctoWoW server threat API; TWThreat or pfUI-ThreatPlates optional |
@@ -76,7 +76,23 @@ Target of each tracked hostile creature (empty = no target), polled every
 `targetInterval` (0.25 s), written on change. Gives who is tanking and when a
 boss switches target.
 
-### RAID_MARK
+### UNIT_COMBAT
+`ts|UNIT_COMBAT|guid|inCombat`
+
+A hostile creature enters (`1`) or leaves (`0`) combat. Read from the "in
+combat" bit of the unit flags (`UNIT_FLAG_IN_COMBAT`, `0x80000`), on Nampower
+`UNIT_FLAGS_GUID` and during the poll of tracked hostiles (`targetInterval`).
+
+- `1`: the mob was pulled (or joined the fight). Mobs only seen idle write nothing.
+- `0` after a `DEATH` of the same unit: it died.
+- `0` with no `DEATH`: it **reset / evaded** (wipe, kited too far, leash).
+  Its health goes back to max and it walks back to its spawn, visible in
+  `UNIT_STATE`; attacks on it during the walk back come out as "Evade" in
+  `SWING` / `MISS`.
+- A mob that goes out of range while in combat is forgotten after 60 s
+  without a `0` line: how its fight ended is unknown.
+
+
 `ts|RAID_MARK|guid|index`
 
 Raid icon 1–8 set on a unit, `0` when removed. Scanned 0.3 s after the last
@@ -117,9 +133,9 @@ command: `/chronicle octo` lists the settings, `/chronicle octo <setting>
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| unitState, target, marks, threat | on | turn each line type on/off |
+| unitState, target, combat, marks, threat | on | turn each line type on/off |
 | position | on | add positions to `UNIT_STATE` and poll them in combat |
-| targetInterval | 0.25 | seconds between target / hostile health and power polls |
+| targetInterval | 0.25 | seconds between target / combat flag / hostile health and power polls |
 | positionInterval | 1 | seconds between position polls (in combat) |
 | positionMinMove | 0.5 | yards a unit must move before a position change alone writes a line |
 | threatQuery | auto | `auto`: ask the server only if TWThreat and pfUI-ThreatPlates are absent; `on`; `off` |
