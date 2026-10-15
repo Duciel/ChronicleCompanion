@@ -835,9 +835,7 @@ local THREAT_QUERY_NEXT = { auto = "on", on = "off", off = "auto" }
 function Octo:CreateOptions(panel)
     local side = CreateFrame("Frame", "ChronicleOctoOptions", panel)
     side:SetWidth(230)
-    -- a bit taller than the options window: room for the six checkboxes and the
-    -- detected APIs without the last lines overlapping
-    side:SetHeight(panel:GetHeight() + 40)
+    side:SetHeight(panel:GetHeight())
     side:SetPoint("TOPLEFT", panel, "TOPRIGHT", -4, 0)
     side:SetBackdrop({
         bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -895,19 +893,8 @@ function Octo:CreateOptions(panel)
     side.queryDesc = queryDesc
     y = y - 58
 
-    -- detected APIs
-    local apiHeader = side:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    apiHeader:SetPoint("TOPLEFT", 20, y)
-    apiHeader:SetText("Detected:")
-    local apiText = side:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    apiText:SetPoint("TOPLEFT", 20, y - 14)
-    apiText:SetWidth(195)
-    apiText:SetJustifyH("LEFT")
-    side.apiText = apiText
-
     local help = side:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-    -- right under the detected APIs (never on top of them, whatever the font size)
-    help:SetPoint("TOPLEFT", apiText, "BOTTOMLEFT", 0, -10)
+    help:SetPoint("TOPLEFT", 20, y)
     help:SetWidth(195)
     help:SetJustifyH("LEFT")
     help:SetText("Intervals: /chronicle octo\nFormat: OCTO_EVENTS.md")
@@ -945,12 +932,10 @@ function Octo:RefreshOptions()
         side.queryDesc:SetText("off: only listens to other addons")
     end
 
+    -- mod versions are in "Version Info" of the main panel; here only the
+    -- position source, next to the checkbox it applies to
     self:DetectPositionApi()
-    local classicApi = Chronicle_ClassicAPIVersion()
-    if classicApi == "" then classicApi = "no" end
-    side.apiText:SetText("Positions: " .. self.positionApi .. "\nClassicAPI: " .. classicApi
-        .. "\nSuperWoW: " .. (SUPERWOW_VERSION or "no")
-        .. "\nNampower fields: " .. (GetUnitField and "yes" or "no"))
+    pos.desc:SetText("x / y / z in UNIT_STATE (" .. self.positionApi .. ")")
 end
 
 local originalCreateOptionsPanel = ChronicleLog.CreateOptionsPanel

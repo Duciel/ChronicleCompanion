@@ -126,8 +126,10 @@ rounded to 1 decimal).
 ## Settings
 
 The options panel (`/clog` or `/chronicle config`) has an **Extra events**
-side panel on its right: one checkbox per line type, the threat request mode
-(auto / on / off) and the APIs detected. Intervals are only in the slash
+side panel on its right: one checkbox per line type (the Positions line shows
+which API gives them) and the threat request mode (auto / on / off). The
+ClassicAPI and SuperWoW versions are listed under **Version Info** in the main
+panel, next to Nampower. Intervals are only in the slash
 command: `/chronicle octo` lists the settings, `/chronicle octo <setting>
 <value>` changes one.
 
