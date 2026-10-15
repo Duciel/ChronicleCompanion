@@ -156,7 +156,7 @@ function Chronicle:ShowHelp()
 	self:Print("/chronicle minimap - Toggle minimap icon visibility")
 	self:Print("/chronicle realm [1|0|true|false] - Toggle or set per-realm log file separation")
 	self:Print("/chronicle file - Show the current log file (one per character, instance and day)")
-	self:Print("/chronicle octo [setting] [value] - Extra events (unitState, position, target, marks, threat)")
+	self:Print("/chronicle octo [setting] [value] - Extra events (unitState, position, target, combat, marks, threat)")
 	self:Print("/chronicle help - Show this help")
 	self:Print("/clog - Open chronicle log options")
 end

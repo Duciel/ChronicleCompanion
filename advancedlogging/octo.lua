@@ -4,6 +4,7 @@
 -- Extra log lines for deeper raid analysis on OctoWoW (1.12 client):
 --   UNIT_STATE      health, power (with its type) and position of a unit, in one line
 --   UNIT_TARGET    target of the hostile units in combat (who is tanking)
+--   UNIT_COMBAT    a hostile unit enters / leaves combat (pulls, resets, evades)
 --   RAID_MARK      raid target icons
 --   THREAT         server threat table of a mob (TWThreat API)
 --   THREAT_TANK    "mobs I am tanking" table (TWThreat tank mode API)
@@ -23,6 +24,7 @@ local Octo = {
     lastData = {},      -- [guid] = last UNIT_STATE written { hp, maxHp, power, maxPower, powerType, map, x, y, z }
     dirty = {},         -- [guid] = unit token or GUID to snapshot at the end of the frame
     lastTarget = {},    -- [guid] = last logged target guid
+    inCombat = {},      -- [guid] = GetTime() of the last check that saw it in combat
     marks = {},         -- [guid] = raid icon index
     missingMarks = {},  -- [guid] = consecutive scans the mark was not seen in
     markScanAt = nil,   -- pending scan after RAID_TARGET_UPDATE
@@ -48,6 +50,7 @@ local UDTS_TM = "TWT_UDTSv4_TM"
 local DEFAULTS = {
     unitState = true,
     target = true,
+    combat = true,
     targetInterval = 0.25,
     position = true,
     positionInterval = 1.0,
@@ -234,6 +237,11 @@ function Octo:Cleanup(now)
     for guid, data in pairs(self.lastThreat) do
         if now - data.time > 30 then self.lastThreat[guid] = nil end
     end
+    -- in-combat units not seen for a minute (out of range, gone): forget them
+    -- without writing anything, we do not know how their fight ended
+    for guid, seen in pairs(self.inCombat) do
+        if now - seen > 60 then self.inCombat[guid] = nil end
+    end
 end
 
 function Octo:Reset()
@@ -241,6 +249,7 @@ function Octo:Reset()
     self.lastData = {}
     self.dirty = {}
     self.lastTarget = {}
+    self.inCombat = {}
     self.marks = {}
     self.missingMarks = {}
     self.markScanAt = nil
@@ -425,6 +434,49 @@ function ChronicleLog:UNIT_ENERGY_GUID(guid, isPlayer, isTarget, isMouseover, is
 end
 
 -- =============================================================================
+-- UNIT_COMBAT: a hostile unit enters (1) or leaves (0) combat
+--   ts|UNIT_COMBAT|guid|1|0
+-- From the "in combat" bit of the unit flags (UNIT_FLAG_IN_COMBAT, 0x80000),
+-- read on Nampower UNIT_FLAGS_GUID and during the hostile poll. A unit that
+-- leaves combat alive (no DEATH line) is a reset / evade: its health goes back
+-- to max and it walks back to its spawn (see UNIT_STATE).
+-- =============================================================================
+
+local UNIT_FLAG_IN_COMBAT = 524288 -- 0x80000
+
+local function HasCombatFlag(flags)
+    flags = tonumber(flags)
+    if not flags then return nil end
+    if flags < 0 then flags = flags + 4294967296 end -- read as a signed int32
+    return math.mod(math.floor(flags / UNIT_FLAG_IN_COMBAT), 2) == 1
+end
+
+--- Checks one creature's combat flag and writes UNIT_COMBAT on a change.
+--- Units only seen out of combat are not remembered, so idle mobs cost nothing.
+function Octo:CheckCombat(guid)
+    if not IsCreature(guid) then return end
+    local inCombat = HasCombatFlag(SafeField(guid, "flags"))
+    if inCombat == nil then return end -- out of range / gone
+    local was = self.inCombat[guid]
+    if inCombat then
+        if not was then
+            ChronicleLog:CheckUnit(guid)
+            ChronicleLog:Write("UNIT_COMBAT", guid, 1)
+        end
+        self.inCombat[guid] = GetTime()
+    elseif was then
+        self.inCombat[guid] = nil
+        ChronicleLog:Write("UNIT_COMBAT", guid, 0)
+    end
+end
+
+function ChronicleLog:UNIT_FLAGS_GUID(guid)
+    if Octo:Get("combat") and ValidGuid(guid) then
+        Octo:CheckCombat(guid)
+    end
+end
+
+-- =============================================================================
 -- UNIT_TARGET (polled: 1.12 has no event for another unit's target change)
 -- =============================================================================
 
@@ -437,9 +489,11 @@ function Octo:PollTargets()
             -- health / power too: the *_GUID events may only fire for units bound
             -- to a token; the snapshot is written only if something changed
             if self:Get("unitState") then self:MarkDirty(guid, guid) end
+            -- combat flag too: UNIT_FLAGS_GUID may only fire for units bound to a token
+            if self:Get("combat") then self:CheckCombat(guid) end
             local target = SafeField(guid, "target")
             if not ValidGuid(target) then target = "" end
-            if self.lastTarget[guid] ~= target then
+            if self:Get("target") and self.lastTarget[guid] ~= target then
                 -- nil means the unit is out of range / gone: keep the last known value
                 if SafeField(guid, "health") then
                     self.lastTarget[guid] = target
@@ -676,7 +730,7 @@ Octo.frame:SetScript("OnUpdate", function()
         Octo:Cleanup(now)
     end
 
-    if Octo:Get("target") and now - Octo.lastTargetPoll >= (tonumber(Octo:Get("targetInterval")) or 0.25) then
+    if (Octo:Get("target") or Octo:Get("combat")) and now - Octo.lastTargetPoll >= (tonumber(Octo:Get("targetInterval")) or 0.25) then
         Octo.lastTargetPoll = now
         Octo:PollTargets()
     end
@@ -716,12 +770,13 @@ table.insert(ChronicleLog.events, "UNIT_MANA_GUID")
 table.insert(ChronicleLog.events, "UNIT_RAGE_GUID")
 table.insert(ChronicleLog.events, "UNIT_ENERGY_GUID")
 table.insert(ChronicleLog.events, "RAID_TARGET_UPDATE")
+table.insert(ChronicleLog.events, "UNIT_FLAGS_GUID")
 
 -- =============================================================================
 -- Slash command: /chronicle octo [setting] [value]
 -- =============================================================================
 
-local BOOL_KEYS = { unitState = true, target = true, position = true, marks = true, threat = true }
+local BOOL_KEYS = { unitState = true, target = true, combat = true, position = true, marks = true, threat = true }
 local NUM_KEYS = { targetInterval = true, positionInterval = true, positionMinMove = true, threatInterval = true, threatLimit = true }
 
 function Octo:Status()
@@ -771,6 +826,7 @@ local UI_TOGGLES = {
     { key = "unitState", label = "Unit state", desc = "UNIT_STATE: health, power" },
     { key = "position", label = "Positions", desc = "x / y / z in UNIT_STATE", parent = "unitState" },
     { key = "target", label = "Mob targets", desc = "UNIT_TARGET: who is tanking" },
+    { key = "combat", label = "Mob combat", desc = "UNIT_COMBAT: pulls, resets, evades" },
     { key = "marks", label = "Raid marks", desc = "RAID_MARK" },
     { key = "threat", label = "Threat", desc = "THREAT, THREAT_TANK" },
 }
@@ -814,7 +870,7 @@ function Octo:CreateOptions(panel)
         desc:SetText(t.desc)
         check.desc = desc
         side.checks[t.key] = check
-        y = y - 40
+        y = y - 34
     end
 
     -- threat requests: auto / on / off
