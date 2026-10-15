@@ -1,7 +1,13 @@
 # ChronicleCompanion — extra log events
 
-Extra log lines for deeper raid analysis, written by `advancedlogging/octo.lua`
+Extra log lines for deeper raid analysis, written by `advancedlogging/ursol.lua`
 on top of everything ChronicleCompanion already logs.
+
+The file is named after "Ursol", the TurtleWoW 1.18.1 client patch, now used by
+the servers that came from TurtleWoW (OctoWoW, Capybara, Ravencraft, ...). Nothing
+in it is tied to one server: every line type runs only when the client provides
+what it needs, so a plain 1.12 client with Nampower logs what it can and the
+rest stays off, without errors.
 
 All lines keep the usual layout `TIMESTAMP_MS|EVENT|field|...`. The event names
 are new, so Chronicle skips them (checked with Chronicle's own parser on a real
@@ -11,12 +17,16 @@ identical results). Existing events are unchanged, except `HEADER` and
 
 ## Requirements
 
-| Feature | Needs |
-| --- | --- |
-| UNIT_STATE (health, power), UNIT_TARGET, UNIT_COMBAT | Nampower (already required) |
-| UNIT_STATE position fields | ClassicAPI (any visible unit) or SuperWoW (friendly units only) |
-| RAID_MARK | nothing; `markN` tokens of ClassicAPI / SuperWoW make it more complete |
-| THREAT, THREAT_TANK | the OctoWoW server threat API; TWThreat or pfUI-ThreatPlates optional |
+| Feature | Needs | Without it |
+| --- | --- | --- |
+| UNIT_STATE (health, power), UNIT_TARGET, UNIT_COMBAT | Nampower with `GetUnitField` | off, events not registered |
+| UNIT_STATE position fields | ClassicAPI (any visible unit) or SuperWoW (friendly units only) | fields left empty, no position poll |
+| RAID_MARK | `GetRaidTargetIndex` and unit GUIDs (Nampower `GetUnitGUID` or SuperWoW); `markN` tokens of ClassicAPI / SuperWoW make it more complete | off |
+| THREAT, THREAT_TANK | a server with the TWThreat threat API (TurtleWoW-based servers); TWThreat or pfUI-ThreatPlates optional | nothing written; requests stop by themselves (see `threatQuery`) |
+
+Line types the client cannot produce are greyed out in the options panel with
+the reason, and marked `(off: ...)` in `/chronicle ursol`. The saved setting is
+kept, so they come back on with the DLL.
 
 ## Events
 
@@ -110,7 +120,7 @@ decimal: the server sends `100.000000`). `source`:
   TWThreat or pfUI-ThreatPlates). `mobGuid` is your target when the answer
   arrived.
 - `relay:<Name>`: a `TWTRelayV2` message shared by a group member (TWThreat
-  octo fork or pfUI-ThreatPlates). `mobGuid` is that player's target, empty if
+  or pfUI-ThreatPlates). `mobGuid` is that player's target, empty if
   it could not be confirmed.
 
 The same table received twice within 1.5 s is written once.
@@ -130,7 +140,7 @@ side panel on its right: one checkbox per line type (the Positions line shows
 which API gives them) and the threat request mode (auto / on / off). The
 ClassicAPI and SuperWoW versions are listed under **Version Info** in the main
 panel, next to Nampower. Intervals are only in the slash
-command: `/chronicle octo` lists the settings, `/chronicle octo <setting>
+command: `/chronicle ursol` lists the settings, `/chronicle ursol <setting>
 <value>` changes one.
 
 | Setting | Default | Meaning |
@@ -140,7 +150,7 @@ command: `/chronicle octo` lists the settings, `/chronicle octo <setting>
 | targetInterval | 0.25 | seconds between target / combat flag / hostile health and power polls |
 | positionInterval | 1 | seconds between position polls (in combat) |
 | positionMinMove | 0.5 | yards a unit must move before a position change alone writes a line |
-| threatQuery | auto | `auto`: ask the server only if TWThreat and pfUI-ThreatPlates are absent; `on`; `off` |
+| threatQuery | auto | `auto`: ask the server only if TWThreat and pfUI-ThreatPlates are absent, and stop after 10 requests without any answer (server without the threat API; an answer, even relayed by the group, turns them back on); `on`: always ask; `off`: only listen |
 | threatInterval | 1 | seconds between threat requests |
 | threatLimit | 10 | players per threat table requested |
 

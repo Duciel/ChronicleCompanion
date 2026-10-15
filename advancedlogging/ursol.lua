@@ -1,24 +1,35 @@
 -- =============================================================================
--- ChronicleLog Octo extensions
+-- ChronicleLog Ursol extensions
 --
--- Extra log lines for deeper raid analysis on OctoWoW (1.12 client):
+-- Extra log lines for deeper raid analysis on 1.12 clients, named after the
+-- TurtleWoW 1.18.1 "Ursol" client used by the servers that came from it
+-- (OctoWoW, Capybara, Ravencraft, ...). Each line type only runs when the client
+-- has what it needs (see CAPS below): a plain 1.12 client with Nampower logs
+-- what it can and never errors on the rest.
+--
 --   UNIT_STATE      health, power (with its type) and position of a unit, in one line
 --   UNIT_TARGET    target of the hostile units in combat (who is tanking)
 --   UNIT_COMBAT    a hostile unit enters / leaves combat (pulls, resets, evades)
 --   RAID_MARK      raid target icons
---   THREAT         server threat table of a mob (TWThreat API)
+--   THREAT         server threat table of a mob (TWThreat server API)
 --   THREAT_TANK    "mobs I am tanking" table (TWThreat tank mode API)
 --
 -- Every line uses the usual TIMESTAMP|EVENT|field|... layout with event names
 -- Chronicle does not know: Chronicle skips them, the separate analysis tool
 -- reads them. Field order of existing events is never changed.
--- See OCTO_EVENTS.md for the format of each line.
+-- See URSOL_EVENTS.md for the format of each line.
 --
--- Requirements: Nampower (GetUnitField, *_GUID events). Optional: ClassicAPI or
--- SuperWoW (UnitPosition, GUID / markN unit tokens). Lua 5.0 syntax only.
+-- Requirements, per line type:
+--   UNIT_STATE, UNIT_TARGET, UNIT_COMBAT   Nampower GetUnitField (+ *_GUID events)
+--   positions in UNIT_STATE                ClassicAPI or SuperWoW UnitPosition
+--   RAID_MARK                              GetRaidTargetIndex + a GUID source
+--                                          (Nampower GetUnitGUID or SuperWoW)
+--   THREAT, THREAT_TANK                    a server with the TWThreat API; requests
+--                                          stop by themselves when nobody answers
+-- Lua 5.0 syntax only.
 -- =============================================================================
 
-local Octo = {
+local Ursol = {
     formatVersion = 2,
     hostiles = {},      -- [guid] = GetTime() of the last combat event involving it
     lastData = {},      -- [guid] = last UNIT_STATE written { hp, maxHp, power, maxPower, powerType, map, x, y, z }
@@ -29,13 +40,16 @@ local Octo = {
     missingMarks = {},  -- [guid] = consecutive scans the mark was not seen in
     markScanAt = nil,   -- pending scan after RAID_TARGET_UPDATE
     lastThreat = {},    -- [mobGuid] = { list, time }
+    caps = {},          -- what this client provides, see DetectCaps
+    threatServer = nil, -- true once the server (or a group relay) answered a threat request
+    threatUnanswered = 0, -- requests sent since the last answer
     lastQuery = 0,
     lastTargetPoll = 0,
     lastPosPoll = 0,
     lastMarkPoll = 0,
     lastCleanup = 0,
 }
-ChronicleOcto = Octo
+ChronicleUrsol = Ursol
 
 local EMPTY_GUID = "0x0000000000000000"
 local HOSTILE_TTL = 15          -- seconds a hostile stays tracked after its last event
@@ -45,8 +59,11 @@ local TANKMODE_API = "TMTv1="
 local RELAY_API = "TWTRelayV2:"
 local TANKSHARE_API = "PFTPTankV1:"
 local UDTS_TM = "TWT_UDTSv4_TM"
+-- auto mode: requests stop after this many without any answer (server without
+-- the TWThreat API, e.g. a plain 1.12 server); one answer turns them back on
+local MAX_UNANSWERED_QUERIES = 10
 
--- Default settings (stored in ChronicleCompanionDB.advancedLog with an "octo_" prefix)
+-- Default settings (stored in ChronicleCompanionDB.advancedLog with an "ursol_" prefix)
 local DEFAULTS = {
     unitState = true,
     target = true,
@@ -62,16 +79,16 @@ local DEFAULTS = {
     threatLimit = 10,
 }
 
-function Octo:Get(key)
+function Ursol:Get(key)
     local db = ChronicleCompanionDB and ChronicleCompanionDB.advancedLog
-    if db and db["octo_" .. key] ~= nil then
-        return db["octo_" .. key]
+    if db and db["ursol_" .. key] ~= nil then
+        return db["ursol_" .. key]
     end
     return DEFAULTS[key]
 end
 
-function Octo:Set(key, value)
-    ChronicleLog:SetSetting("octo_" .. key, value)
+function Ursol:Set(key, value)
+    ChronicleLog:SetSetting("ursol_" .. key, value)
 end
 
 -- =============================================================================
@@ -95,8 +112,12 @@ end
 
 local function GuidOf(unit)
     if GetUnitGUID then
-        local guid = GetUnitGUID(unit)
-        if ValidGuid(guid) then return guid end
+        local ok, guid = pcall(GetUnitGUID, unit)
+        if ok and ValidGuid(guid) then return guid end
+    elseif SUPERWOW_VERSION then
+        -- SuperWoW: UnitExists returns the GUID as its second value
+        local ok, exists, guid = pcall(UnitExists, unit)
+        if ok and exists and ValidGuid(guid) then return guid end
     end
     return nil
 end
@@ -157,7 +178,7 @@ end
 -- Detects which UnitPosition is active. ClassicAPI returns posY, posX, posZ,
 -- instanceID; SuperWoW returns x, y, z. When both DLLs are loaded the last one
 -- to register wins, so the shape is checked at runtime.
-function Octo:DetectPositionApi()
+function Ursol:DetectPositionApi()
     if not UnitPosition then
         self.positionApi = "none"
         return
@@ -174,7 +195,7 @@ end
 
 --- Returns world x, y, z of a unit token or GUID, plus the Map.dbc id when the
 --- API gives it (ClassicAPI), or nil.
-function Octo:Position(unit)
+function Ursol:Position(unit)
     if self.positionApi == "none" or not UnitPosition then return nil end
     local ok, a, b, c, d = pcall(UnitPosition, unit)
     if not ok or not a then return nil end
@@ -185,12 +206,62 @@ function Octo:Position(unit)
 end
 
 --- Map.dbc id of the current map: ClassicAPI GetInstanceInfo, else nil.
-function Octo:CurrentMapId()
+function Ursol:CurrentMapId()
     if GetInstanceInfo then
         local ok, _, _, _, _, _, _, _, instanceID = pcall(GetInstanceInfo)
         if ok and instanceID then return instanceID end
     end
     return nil
+end
+
+-- =============================================================================
+-- Client capabilities: every line type runs only when the client provides what
+-- it needs. DLLs load before addons, so this is known at load time; it is
+-- checked again when logging is enabled.
+-- =============================================================================
+
+-- setting -> capability it needs, and what to tell the user when it is missing
+local NEEDS = {
+    unitState = "fields",
+    target = "fields",
+    combat = "fields",
+    position = "position",
+    marks = "marks",
+}
+local MISSING = {
+    fields = "needs Nampower (GetUnitField)",
+    position = "needs ClassicAPI or SuperWoW",
+    marks = "needs Nampower or SuperWoW GUIDs",
+}
+
+function Ursol:DetectCaps()
+    self:DetectPositionApi()
+    local caps = self.caps
+    caps.fields = GetUnitField ~= nil
+    caps.guid = GetUnitGUID ~= nil or SUPERWOW_VERSION ~= nil
+    caps.position = caps.fields and (self.positionApi == "classicapi" or self.positionApi == "superwow")
+    caps.marks = GetRaidTargetIndex ~= nil and caps.guid
+end
+
+--- True when the client can produce this line type.
+function Ursol:Available(key)
+    local need = NEEDS[key]
+    return not need or self.caps[need] and true or false
+end
+
+--- Text explaining why a line type is unavailable, or nil.
+function Ursol:MissingText(key)
+    if self:Available(key) then return nil end
+    -- positions are written in UNIT_STATE lines, which need Nampower first
+    if key == "position" and not self.caps.fields then return MISSING.fields end
+    return MISSING[NEEDS[key]]
+end
+
+--- Setting on and supported by the client. Positions also need UNIT_STATE.
+function Ursol:Active(key)
+    if not self:Get(key) or not self:Available(key) then return false end
+    if key == "position" then return self:Active("unitState") end
+    return true
 end
 
 local function Round(value, decimals)
@@ -199,14 +270,25 @@ local function Round(value, decimals)
     return math.floor(value * mult + 0.5) / mult
 end
 
-function Octo:ThreatQueryActive()
+function Ursol:ThreatQueryActive()
     local mode = self:Get("threatQuery")
     if mode == "on" then return true end
     if mode == "off" then return false end
     -- auto: let TWThreat / pfUI-ThreatPlates do the querying, we only listen
     if TWT and TWT.UDTS then return false end
     if pfUI and pfUI.threatplates then return false end
+    -- and stop asking a server that never answers (no TWThreat API)
+    if not self.threatServer and self.threatUnanswered >= MAX_UNANSWERED_QUERIES then
+        return false
+    end
     return true
+end
+
+--- Threat API state for the panel and /chronicle ursol.
+function Ursol:ThreatServerText()
+    if self.threatServer then return "server answers" end
+    if self.threatUnanswered >= MAX_UNANSWERED_QUERIES then return "no server answer, requests stopped" end
+    return "not seen yet"
 end
 
 -- =============================================================================
@@ -216,17 +298,17 @@ end
 local originalCheckUnit = ChronicleLog.CheckUnit
 function ChronicleLog:CheckUnit(guid)
     if IsCreature(guid) then
-        Octo.hostiles[guid] = GetTime()
+        Ursol.hostiles[guid] = GetTime()
     end
     return originalCheckUnit(self, guid)
 end
 
-function Octo:IsTracked(guid)
+function Ursol:IsTracked(guid)
     local seen = self.hostiles[guid]
     return seen and (GetTime() - seen) < HOSTILE_TTL
 end
 
-function Octo:Cleanup(now)
+function Ursol:Cleanup(now)
     for guid, seen in pairs(self.hostiles) do
         if now - seen > HOSTILE_TTL then
             self.hostiles[guid] = nil
@@ -244,7 +326,7 @@ function Octo:Cleanup(now)
     end
 end
 
-function Octo:Reset()
+function Ursol:Reset()
     self.hostiles = {}
     self.lastData = {}
     self.dirty = {}
@@ -261,8 +343,8 @@ end
 -- (superWowVersion, classicApi, threatMode) and ZONE_INFO (mapId)
 -- =============================================================================
 
-function Octo:WriteInfo()
-    self:DetectPositionApi()
+function Ursol:WriteInfo()
+    self:DetectCaps()
     self.mapId = self:CurrentMapId()
 end
 
@@ -270,8 +352,8 @@ local originalWriteZoneInfo = ChronicleLog.WriteZoneInfo
 function ChronicleLog:WriteZoneInfo(force)
     originalWriteZoneInfo(self, force)
     if self:IsEnabled() then
-        Octo:Reset()
-        Octo:WriteInfo()
+        Ursol:Reset()
+        Ursol:WriteInfo()
     end
 end
 
@@ -280,9 +362,9 @@ function ChronicleLog:Enable()
     local wasEnabled = self.enabled
     originalEnable(self)
     if not wasEnabled and self.enabled then
-        Octo:Reset()
-        Octo:WriteInfo()
-        Octo:ScanMarks()
+        Ursol:Reset()
+        Ursol:WriteInfo()
+        Ursol:ScanMarks()
     end
 end
 
@@ -318,7 +400,7 @@ local function PowerTypeOf(unit)
     return nil
 end
 
-function Octo:MarkDirty(guid, unit)
+function Ursol:MarkDirty(guid, unit)
     if ValidGuid(guid) then
         self.dirty[guid] = unit or guid
     end
@@ -330,7 +412,7 @@ local scratch = {}
 local SNAP_FIELDS = { "hp", "maxHp", "powerType", "power", "maxPower", "x", "y", "z", "map" }
 local NSNAP = 9
 
-function Octo:Snapshot(guid, unit)
+function Ursol:Snapshot(guid, unit)
     local hp = SafeField(unit, "health")
     if not hp then return nil end
     local data = scratch
@@ -349,7 +431,7 @@ function Octo:Snapshot(guid, unit)
         end
     end
 
-    if self:Get("position") then
+    if self:Active("position") then
         local x, y, z, mapId = self:Position(unit)
         if x then
             data.x, data.y, data.z = Round(x, 1), Round(y, 1), Round(z, 1)
@@ -360,7 +442,7 @@ function Octo:Snapshot(guid, unit)
     return data
 end
 
-function Octo:Changed(old, new)
+function Ursol:Changed(old, new)
     if not old then return true end
     if old.hp ~= new.hp or old.maxHp ~= new.maxHp or old.power ~= new.power
         or old.maxPower ~= new.maxPower or old.powerType ~= new.powerType or old.map ~= new.map then
@@ -376,7 +458,7 @@ function Octo:Changed(old, new)
 end
 
 --- Takes a snapshot of one unit and writes UNIT_STATE if anything changed.
-function Octo:WriteUnitState(guid, unit)
+function Ursol:WriteUnitState(guid, unit)
     local data = self:Snapshot(guid, unit)
     if not data then return end
     local old = self.lastData[guid]
@@ -396,7 +478,7 @@ function Octo:WriteUnitState(guid, unit)
 end
 
 --- Writes the units marked by the polls (at most one line per unit per frame).
-function Octo:FlushDirty()
+function Ursol:FlushDirty()
     for guid, unit in pairs(self.dirty) do
         self:WriteUnitState(guid, unit)
         self.dirty[guid] = nil
@@ -409,8 +491,8 @@ local function IsGrouped(isPlayer, isPet, partyIndex, raidIndex)
         or (tonumber(raidIndex) or 0) > 0
 end
 
-function Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
-    if not self:Get("unitState") or not ValidGuid(guid) then return end
+function Ursol:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
+    if not self:Active("unitState") or not ValidGuid(guid) then return end
     if IsGrouped(isPlayer, isPet, partyIndex, raidIndex) or self:IsTracked(guid) then
         -- written right away so the timestamp is the one of the event
         self:WriteUnitState(guid, guid)
@@ -418,19 +500,19 @@ function Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
 end
 
 function ChronicleLog:UNIT_HEALTH_GUID(guid, isPlayer, isTarget, isMouseover, isPet, partyIndex, raidIndex)
-    Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
+    Ursol:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
 end
 
 function ChronicleLog:UNIT_MANA_GUID(guid, isPlayer, isTarget, isMouseover, isPet, partyIndex, raidIndex)
-    Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
+    Ursol:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
 end
 
 function ChronicleLog:UNIT_RAGE_GUID(guid, isPlayer, isTarget, isMouseover, isPet, partyIndex, raidIndex)
-    Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
+    Ursol:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
 end
 
 function ChronicleLog:UNIT_ENERGY_GUID(guid, isPlayer, isTarget, isMouseover, isPet, partyIndex, raidIndex)
-    Octo:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
+    Ursol:OnUnitEvent(guid, isPlayer, isPet, partyIndex, raidIndex)
 end
 
 -- =============================================================================
@@ -453,7 +535,7 @@ end
 
 --- Checks one creature's combat flag and writes UNIT_COMBAT on a change.
 --- Units only seen out of combat are not remembered, so idle mobs cost nothing.
-function Octo:CheckCombat(guid)
+function Ursol:CheckCombat(guid)
     if not IsCreature(guid) then return end
     local inCombat = HasCombatFlag(SafeField(guid, "flags"))
     if inCombat == nil then return end -- out of range / gone
@@ -471,8 +553,8 @@ function Octo:CheckCombat(guid)
 end
 
 function ChronicleLog:UNIT_FLAGS_GUID(guid)
-    if Octo:Get("combat") and ValidGuid(guid) then
-        Octo:CheckCombat(guid)
+    if Ursol:Active("combat") and ValidGuid(guid) then
+        Ursol:CheckCombat(guid)
     end
 end
 
@@ -480,7 +562,7 @@ end
 -- UNIT_TARGET (polled: 1.12 has no event for another unit's target change)
 -- =============================================================================
 
-function Octo:PollTargets()
+function Ursol:PollTargets()
     local count = 0
     for guid in pairs(self.hostiles) do
         if self:IsTracked(guid) then
@@ -488,12 +570,12 @@ function Octo:PollTargets()
             if count > MAX_POLL_UNITS then return end
             -- health / power too: the *_GUID events may only fire for units bound
             -- to a token; the snapshot is written only if something changed
-            if self:Get("unitState") then self:MarkDirty(guid, guid) end
+            if self:Active("unitState") then self:MarkDirty(guid, guid) end
             -- combat flag too: UNIT_FLAGS_GUID may only fire for units bound to a token
-            if self:Get("combat") then self:CheckCombat(guid) end
+            if self:Active("combat") then self:CheckCombat(guid) end
             local target = SafeField(guid, "target")
             if not ValidGuid(target) then target = "" end
-            if self:Get("target") and self.lastTarget[guid] ~= target then
+            if self:Active("target") and self.lastTarget[guid] ~= target then
                 -- nil means the unit is out of range / gone: keep the last known value
                 if SafeField(guid, "health") then
                     self.lastTarget[guid] = target
@@ -509,8 +591,8 @@ end
 -- UNIT_STATE snapshot is written if they moved more than positionMinMove
 -- =============================================================================
 
-function Octo:PollPositions()
-    if self.positionApi == "none" or self.positionApi == "unknown" then return end
+function Ursol:PollPositions()
+    if not self:Active("position") then return end
     local tokens = GroupTokens()
     for i = 1, table.getn(tokens) do
         local guid = GuidOf(tokens[i])
@@ -530,8 +612,8 @@ end
 -- RAID_MARK
 -- =============================================================================
 
-function Octo:ScanMarks()
-    if not self:Get("marks") or not ChronicleLog:IsEnabled() then return end
+function Ursol:ScanMarks()
+    if not self:Active("marks") or not ChronicleLog:IsEnabled() then return end
     local current = {}
     -- markN tokens (SuperWoW / ClassicAPI)
     for i = 1, 8 do
@@ -545,8 +627,8 @@ function Octo:ScanMarks()
         for j = 1, 2 do
             local guid = GuidOf(unit)
             if guid and not current[guid] then
-                local index = GetRaidTargetIndex(unit)
-                if index then current[guid] = index end
+                local ok, index = pcall(GetRaidTargetIndex, unit)
+                if ok and index then current[guid] = index end
             end
             unit = RAID_TARGET_TOKENS[unit] or (unit .. "target")
         end
@@ -580,7 +662,7 @@ end
 
 -- RAID_TARGET_UPDATE comes in bursts: one scan 0.3 s after the last one
 function ChronicleLog:RAID_TARGET_UPDATE()
-    Octo.markScanAt = GetTime() + 0.3
+    Ursol.markScanAt = GetTime() + 0.3
 end
 
 -- =============================================================================
@@ -626,9 +708,9 @@ local function RoundThreatList(list)
     end
     return result
 end
-Octo.RoundThreatList = RoundThreatList
+Ursol.RoundThreatList = RoundThreatList
 
-function Octo:WriteThreat(mobGuid, mobName, source, list)
+function Ursol:WriteThreat(mobGuid, mobName, source, list)
     if not list or list == "" then return end
     list = RoundThreatList(list)
     local key = mobGuid ~= "" and mobGuid or ("name:" .. (mobName or ""))
@@ -643,7 +725,9 @@ end
 
 --- Server answer to a TWT_UDTSv4[_TM] request sent by this client (any addon).
 --- The table belongs to the mob this client currently targets.
-function Octo:HandleServerThreat(message)
+function Ursol:HandleServerThreat(message)
+    self.threatServer = true
+    self.threatUnanswered = 0
     local threatPart, tankPart = message, nil
     local split = strfind(message, "#", 1, true)
     if split then
@@ -669,7 +753,8 @@ function Octo:HandleServerThreat(message)
 end
 
 --- TWTRelayV2:<mob>#name:tank:threat:perc:melee;...   (mob = the sender's target)
-function Octo:HandleRelay(message, sender)
+function Ursol:HandleRelay(message, sender)
+    self.threatServer = true -- a group member got an answer: the server has the API
     local body = strsub(message, strlen(RELAY_API) + 1)
     local sep = strfind(body, "#", 1, true)
     if not sep then return end
@@ -684,14 +769,14 @@ end
 
 local originalChatMsgAddon = ChronicleLog.CHAT_MSG_ADDON
 function ChronicleLog:CHAT_MSG_ADDON(prefix, message, channel, sender)
-    if message and Octo:Get("threat") then
+    if message and Ursol:Get("threat") then
         if strfind(message, THREAT_API, 1, true) then
-            Octo:HandleServerThreat(message)
+            Ursol:HandleServerThreat(message)
             return
         end
         if prefix == "TWT" and sender ~= UnitName("player") then
             if strsub(message, 1, strlen(RELAY_API)) == RELAY_API then
-                Octo:HandleRelay(message, sender)
+                Ursol:HandleRelay(message, sender)
                 return
             end
             if strsub(message, 1, strlen(TANKSHARE_API)) == TANKSHARE_API then
@@ -708,95 +793,108 @@ function ChronicleLog:CHAT_MSG_ADDON(prefix, message, channel, sender)
     end
 end
 
-function Octo:QueryThreat()
+function Ursol:QueryThreat()
     local channel = GroupChannel()
     if not channel then return end
+    if not SendAddonMessage then return end
     if not UnitExists("target") or UnitIsPlayer("target") or not UnitCanAttack("player", "target") then return end
     SendAddonMessage(UDTS_TM, "limit=" .. (tonumber(self:Get("threatLimit")) or 10), channel)
+    if not self.threatServer then
+        self.threatUnanswered = self.threatUnanswered + 1
+    end
 end
 
 -- =============================================================================
 -- Polling frame
 -- =============================================================================
 
-Octo.frame = CreateFrame("Frame", "ChronicleOctoFrame")
-Octo.frame:SetScript("OnUpdate", function()
+Ursol.frame = CreateFrame("Frame", "ChronicleUrsolFrame")
+Ursol.frame:SetScript("OnUpdate", function()
     if not ChronicleLog.enabled then return end
     local now = GetTime()
     local inCombat = UnitAffectingCombat("player")
 
-    if now - Octo.lastCleanup > 5 then
-        Octo.lastCleanup = now
-        Octo:Cleanup(now)
+    if now - Ursol.lastCleanup > 5 then
+        Ursol.lastCleanup = now
+        Ursol:Cleanup(now)
     end
 
-    if (Octo:Get("target") or Octo:Get("combat")) and now - Octo.lastTargetPoll >= (tonumber(Octo:Get("targetInterval")) or 0.25) then
-        Octo.lastTargetPoll = now
-        Octo:PollTargets()
+    if (Ursol:Active("target") or Ursol:Active("combat")) and now - Ursol.lastTargetPoll >= (tonumber(Ursol:Get("targetInterval")) or 0.25) then
+        Ursol.lastTargetPoll = now
+        Ursol:PollTargets()
     end
 
-    if inCombat and Octo:Get("position") and now - Octo.lastPosPoll >= (tonumber(Octo:Get("positionInterval")) or 1) then
-        Octo.lastPosPoll = now
-        Octo:PollPositions()
+    if inCombat and Ursol:Active("position") and now - Ursol.lastPosPoll >= (tonumber(Ursol:Get("positionInterval")) or 1) then
+        Ursol.lastPosPoll = now
+        Ursol:PollPositions()
     end
 
     -- RAID_TARGET_UPDATE has no payload and can fire before units are known
-    if Octo.markScanAt and now >= Octo.markScanAt then
-        Octo.markScanAt = nil
-        Octo.lastMarkPoll = now
-        Octo:ScanMarks()
+    if Ursol.markScanAt and now >= Ursol.markScanAt then
+        Ursol.markScanAt = nil
+        Ursol.lastMarkPoll = now
+        Ursol:ScanMarks()
     end
-    if inCombat and Octo:Get("marks") and now - Octo.lastMarkPoll >= 5 then
-        Octo.lastMarkPoll = now
-        Octo:ScanMarks()
-    end
-
-    if inCombat and Octo:Get("threat") and Octo:ThreatQueryActive()
-        and now - Octo.lastQuery >= math.max(0.3, tonumber(Octo:Get("threatInterval")) or 1) then
-        Octo.lastQuery = now
-        Octo:QueryThreat()
+    if inCombat and Ursol:Active("marks") and now - Ursol.lastMarkPoll >= 5 then
+        Ursol.lastMarkPoll = now
+        Ursol:ScanMarks()
     end
 
-    if Octo:Get("unitState") then
-        Octo:FlushDirty()
+    if inCombat and Ursol:Get("threat") and Ursol:ThreatQueryActive()
+        and now - Ursol.lastQuery >= math.max(0.3, tonumber(Ursol:Get("threatInterval")) or 1) then
+        Ursol.lastQuery = now
+        Ursol:QueryThreat()
+    end
+
+    if Ursol:Active("unitState") then
+        Ursol:FlushDirty()
     else
-        Octo.dirty = {}
+        Ursol.dirty = {}
     end
 end)
 
--- New events (registered by ChronicleLog:Enable with the rest)
-table.insert(ChronicleLog.events, "UNIT_HEALTH_GUID")
-table.insert(ChronicleLog.events, "UNIT_MANA_GUID")
-table.insert(ChronicleLog.events, "UNIT_RAGE_GUID")
-table.insert(ChronicleLog.events, "UNIT_ENERGY_GUID")
-table.insert(ChronicleLog.events, "RAID_TARGET_UPDATE")
-table.insert(ChronicleLog.events, "UNIT_FLAGS_GUID")
+-- New events (registered by ChronicleLog:Enable with the rest), only those the
+-- client can use
+Ursol:DetectCaps()
+if Ursol.caps.fields then
+    table.insert(ChronicleLog.events, "UNIT_HEALTH_GUID")
+    table.insert(ChronicleLog.events, "UNIT_MANA_GUID")
+    table.insert(ChronicleLog.events, "UNIT_RAGE_GUID")
+    table.insert(ChronicleLog.events, "UNIT_ENERGY_GUID")
+    table.insert(ChronicleLog.events, "UNIT_FLAGS_GUID")
+end
+if Ursol.caps.marks then
+    table.insert(ChronicleLog.events, "RAID_TARGET_UPDATE")
+end
 
 -- =============================================================================
--- Slash command: /chronicle octo [setting] [value]
+-- Slash command: /chronicle ursol [setting] [value]
 -- =============================================================================
 
 local BOOL_KEYS = { unitState = true, target = true, combat = true, position = true, marks = true, threat = true }
 local NUM_KEYS = { targetInterval = true, positionInterval = true, positionMinMove = true, threatInterval = true, threatLimit = true }
 
-function Octo:Status()
-    self:DetectPositionApi()
-    Chronicle:Print("Octo log format v" .. self.formatVersion .. " - position API: " .. self.positionApi
-        .. ", threat: " .. (self:ThreatQueryActive() and "query" or "listen only"))
+function Ursol:Status()
+    self:DetectCaps()
+    Chronicle:Print("Ursol log format v" .. self.formatVersion .. " - position API: " .. self.positionApi
+        .. ", threat: " .. (self:ThreatQueryActive() and "query" or "listen only")
+        .. " (" .. self:ThreatServerText() .. ")")
     for key in pairs(DEFAULTS) do
-        Chronicle:Print("  " .. key .. " = " .. tostring(self:Get(key)))
+        local missing = self:MissingText(key)
+        Chronicle:Print("  " .. key .. " = " .. tostring(self:Get(key))
+            .. (missing and (" (off: " .. missing .. ")") or ""))
     end
 end
 
 local KEY_BY_LOWER = {}
 for key in pairs(DEFAULTS) do KEY_BY_LOWER[strlower(key)] = key end
 
-function Octo:Slash(key, value)
+function Ursol:Slash(key, value)
     if key and key ~= "" then key = KEY_BY_LOWER[strlower(key)] or key end
     if value then value = strlower(value) end
     if not key or key == "" then
         self:Status()
-        Chronicle:Print("/chronicle octo <setting> <value>  (on/off, a number, or auto/on/off for threatQuery)")
+        Chronicle:Print("/chronicle ursol <setting> <value>  (on/off, a number, or auto/on/off for threatQuery)")
         return
     end
     if BOOL_KEYS[key] then
@@ -805,15 +903,15 @@ function Octo:Slash(key, value)
         elseif value == "off" or value == "0" or value == "false" then new = false
         else new = not self:Get(key) end
         self:Set(key, new)
-        Chronicle:Print("octo " .. key .. " = " .. tostring(new))
+        Chronicle:Print("ursol " .. key .. " = " .. tostring(new))
     elseif NUM_KEYS[key] and tonumber(value) then
         self:Set(key, tonumber(value))
-        Chronicle:Print("octo " .. key .. " = " .. value)
+        Chronicle:Print("ursol " .. key .. " = " .. value)
     elseif key == "threatQuery" and (value == "auto" or value == "on" or value == "off") then
         self:Set(key, value)
-        Chronicle:Print("octo threatQuery = " .. value)
+        Chronicle:Print("ursol threatQuery = " .. value)
     else
-        Chronicle:Print("Unknown octo setting or value: " .. key .. " " .. (value or ""))
+        Chronicle:Print("Unknown ursol setting or value: " .. key .. " " .. (value or ""))
     end
 end
 
@@ -832,8 +930,8 @@ local UI_TOGGLES = {
 }
 local THREAT_QUERY_NEXT = { auto = "on", on = "off", off = "auto" }
 
-function Octo:CreateOptions(panel)
-    local side = CreateFrame("Frame", "ChronicleOctoOptions", panel)
+function Ursol:CreateOptions(panel)
+    local side = CreateFrame("Frame", "ChronicleUrsolOptions", panel)
     side:SetWidth(230)
     side:SetHeight(panel:GetHeight())
     side:SetPoint("TOPLEFT", panel, "TOPRIGHT", -4, 0)
@@ -846,7 +944,7 @@ function Octo:CreateOptions(panel)
 
     local title = side:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     title:SetPoint("TOP", 0, -18)
-    title:SetText("Extra events (OctoWoW)")
+    title:SetText("Extra events (Ursol)")
 
     local subtitle = side:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     subtitle:SetPoint("TOP", title, "BOTTOM", 0, -2)
@@ -857,18 +955,19 @@ function Octo:CreateOptions(panel)
     for i = 1, table.getn(UI_TOGGLES) do
         local t = UI_TOGGLES[i]
         local x = t.parent and 36 or 20
-        local check = CreateFrame("CheckButton", "ChronicleOctoCheck_" .. t.key, side, "UICheckButtonTemplate")
+        local check = CreateFrame("CheckButton", "ChronicleUrsolCheck_" .. t.key, side, "UICheckButtonTemplate")
         check:SetPoint("TOPLEFT", x, y)
         getglobal(check:GetName() .. "Text"):SetText(t.label)
         check.key = t.key
         check:SetScript("OnClick", function()
-            Octo:Set(this.key, this:GetChecked() == 1)
-            Octo:RefreshOptions()
+            Ursol:Set(this.key, this:GetChecked() == 1)
+            Ursol:RefreshOptions()
         end)
         local desc = side:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
         desc:SetPoint("TOPLEFT", x + 26, y - 20)
         desc:SetText(t.desc)
         check.desc = desc
+        check.baseDesc = t.desc
         side.checks[t.key] = check
         y = y - 34
     end
@@ -877,13 +976,13 @@ function Octo:CreateOptions(panel)
     local queryLabel = side:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
     queryLabel:SetPoint("TOPLEFT", 36, y - 4)
     queryLabel:SetText("Server requests:")
-    local queryButton = CreateFrame("Button", "ChronicleOctoThreatQuery", side, "UIPanelButtonTemplate")
+    local queryButton = CreateFrame("Button", "ChronicleUrsolThreatQuery", side, "UIPanelButtonTemplate")
     queryButton:SetWidth(55)
     queryButton:SetHeight(18)
     queryButton:SetPoint("LEFT", queryLabel, "RIGHT", 6, 0)
     queryButton:SetScript("OnClick", function()
-        Octo:Set("threatQuery", THREAT_QUERY_NEXT[Octo:Get("threatQuery")] or "auto")
-        Octo:RefreshOptions()
+        Ursol:Set("threatQuery", THREAT_QUERY_NEXT[Ursol:Get("threatQuery")] or "auto")
+        Ursol:RefreshOptions()
     end)
     side.queryButton = queryButton
     local queryDesc = side:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
@@ -897,26 +996,37 @@ function Octo:CreateOptions(panel)
     help:SetPoint("TOPLEFT", 20, y)
     help:SetWidth(195)
     help:SetJustifyH("LEFT")
-    help:SetText("Intervals: /chronicle octo\nFormat: OCTO_EVENTS.md")
+    help:SetText("Intervals: /chronicle ursol\nFormat: URSOL_EVENTS.md")
 
     self.options = side
 end
 
-function Octo:RefreshOptions()
+function Ursol:RefreshOptions()
     local side = self.options
     if not side then return end
-    for key, check in pairs(side.checks) do
-        check:SetChecked(self:Get(key) and 1 or nil)
-    end
+    self:DetectCaps()
 
-    -- positions are part of UNIT_STATE: greyed out when it is off
-    local pos = side.checks.position
-    if self:Get("unitState") then
-        pos:Enable()
-        getglobal(pos:GetName() .. "Text"):SetTextColor(1, 1, 1)
-    else
-        pos:Disable()
-        getglobal(pos:GetName() .. "Text"):SetTextColor(0.5, 0.5, 0.5)
+    for key, check in pairs(side.checks) do
+        local missing = self:MissingText(key)
+        -- positions are part of UNIT_STATE: greyed out when it is off
+        local usable = not missing and (key ~= "position" or self:Active("unitState"))
+        if usable then
+            check:Enable()
+            getglobal(check:GetName() .. "Text"):SetTextColor(1, 1, 1)
+        else
+            check:Disable()
+            getglobal(check:GetName() .. "Text"):SetTextColor(0.5, 0.5, 0.5)
+        end
+        -- a line type the client cannot produce is shown unchecked, with the reason;
+        -- the saved setting is kept for when the DLL is back
+        check:SetChecked((self:Get(key) and not missing) and 1 or nil)
+        if missing then
+            check.desc:SetText("|cffff6060" .. missing .. "|r")
+        elseif key == "position" then
+            check.desc:SetText(check.baseDesc .. " (" .. self.positionApi .. ")")
+        else
+            check.desc:SetText(check.baseDesc)
+        end
     end
 
     local mode = self:Get("threatQuery")
@@ -924,28 +1034,28 @@ function Octo:RefreshOptions()
     if self:Get("threat") then side.queryButton:Enable() else side.queryButton:Disable() end
     local active = self:ThreatQueryActive()
     if mode == "auto" then
-        side.queryDesc:SetText(active and "auto: no threat addon, this addon asks"
-            or "auto: TWThreat / ThreatPlates ask, this addon listens")
+        if active then
+            side.queryDesc:SetText("auto: no threat addon, this addon asks")
+        elseif (TWT and TWT.UDTS) or (pfUI and pfUI.threatplates) then
+            side.queryDesc:SetText("auto: TWThreat / ThreatPlates ask, this addon listens")
+        else
+            side.queryDesc:SetText("auto: no server answer, requests stopped")
+        end
     elseif mode == "on" then
         side.queryDesc:SetText("on: this addon always asks the server")
     else
         side.queryDesc:SetText("off: only listens to other addons")
     end
-
-    -- mod versions are in "Version Info" of the main panel; here only the
-    -- position source, next to the checkbox it applies to
-    self:DetectPositionApi()
-    pos.desc:SetText("x / y / z in UNIT_STATE (" .. self.positionApi .. ")")
 end
 
 local originalCreateOptionsPanel = ChronicleLog.CreateOptionsPanel
 function ChronicleLog:CreateOptionsPanel()
     originalCreateOptionsPanel(self)
-    if self.optionsPanel then Octo:CreateOptions(self.optionsPanel) end
+    if self.optionsPanel then Ursol:CreateOptions(self.optionsPanel) end
 end
 
 local originalRefreshOptionsPanel = ChronicleLog.RefreshOptionsPanel
 function ChronicleLog:RefreshOptionsPanel()
     originalRefreshOptionsPanel(self)
-    Octo:RefreshOptions()
+    Ursol:RefreshOptions()
 end

@@ -312,11 +312,11 @@ function ChronicleLog:GenerateHeader()
     -- Combat log range
     local combatLogRange = GetCVar("CombatLogRangeCreature") or ""
 
-    -- Client mods and threat logging mode (see advancedlogging/octo.lua)
+    -- Client mods and threat logging mode (see advancedlogging/ursol.lua)
     local classicApi = Chronicle_ClassicAPIVersion()
     local threatMode = ""
-    if ChronicleOcto and ChronicleOcto:Get("threat") then
-        threatMode = ChronicleOcto:ThreatQueryActive() and "query" or "listen"
+    if ChronicleUrsol and ChronicleUrsol:Get("threat") then
+        threatMode = ChronicleUrsol:ThreatQueryActive() and "query" or "listen"
     end
     
     local parts = {
