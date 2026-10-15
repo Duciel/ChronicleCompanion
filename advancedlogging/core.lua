@@ -27,6 +27,9 @@ ChronicleLog.isTurtleWow = (tonumber(wowBuild) == 7272)
 -- Delimiter for log output format: TIMESTAMP|EVENT_TYPE|field1|field2|...
 local LOG_SEP = "|"
 
+-- PERF: lines written per frame by a deferred combat-end save
+local FLUSH_CHUNK_LINES = 1000
+
 local RAID_GROUP_DEBOUNCE_DELAY = 0.25
 local RAID_GROUP_RETRY_DELAY = 0.25
 local RAID_GROUP_MAX_RETRIES = 8
@@ -143,6 +146,10 @@ function ChronicleLog:Init()
     local lastTransmogCheck = 0
     self.frame:SetScript("OnUpdate", function()
         local now = GetTime()
+        -- PERF: write a deferred combat-end save a few lines per frame
+        if ChronicleLog.pendingFlush then
+            ChronicleLog:DrainPendingFlush(FLUSH_CHUNK_LINES)
+        end
         ChronicleLog:ProcessScheduledRaidGroupCapture(now)
 
         -- Throttle transmog and talent work to every 0.5 seconds
@@ -163,8 +170,11 @@ function ChronicleLog:Init()
     self.frame:SetScript("OnEvent", function()
         local autoSave = (event == "PLAYER_REGEN_ENABLED" and self:GetSetting("autoCombatSave"))
         -- Always process zone changes (for auto-enable/disable even when logging is off)
-        if event == "PLAYER_ENTERING_WORLD" or autoSave then
+        if event == "PLAYER_ENTERING_WORLD" then
             ChronicleLog:FlushToFile()
+        elseif autoSave then
+            -- PERF: spread over the next frames instead of one freeze
+            ChronicleLog:FlushToFile(true)
         end
 
         if event == "ZONE_CHANGED_NEW_AREA" or event == "PLAYER_ENTERING_WORLD" then
@@ -332,15 +342,22 @@ end
 --- Uses Lua 5.0 vararg style (arg table) for Vanilla WoW compatibility.
 --- Buffer is written to file when logging is disabled via ChronicleLog:Disable().
 ---@param eventType string Event type code (SWING, CAST, DEATH, COMBAT_START, COMBAT_END, RAW)
+-- PERF: one reused table assembles every line (was a new table per line)
+local writeParts = {}
+
 function ChronicleLog:Write(eventType, ...)
     -- Millisecond timestamp: combine GetTime() precision with unix offset
     local timestamp = math.floor((GetTime() + self.timeOffset) * 1000)
-    local parts = { timestamp, eventType }
+    local parts = writeParts
+    parts[1] = timestamp
+    parts[2] = eventType
+    local count = 2
     for i = 1, arg.n do
         local v = arg[i]
-        parts[table.getn(parts) + 1] = v ~= nil and tostring(v) or ""
+        count = count + 1
+        parts[count] = v ~= nil and tostring(v) or ""
     end
-    local line = table.concat(parts, LOG_SEP)
+    local line = table.concat(parts, LOG_SEP, 1, count)
     
     -- Append to in-memory buffer
     self.bufferSize = self.bufferSize + 1
@@ -363,7 +380,15 @@ end
 --- Appends to existing file content using native append mode.
 --- Filename: see ChronicleLog:GetLogFilename()
 ---@return number linesWritten Number of new lines written
-function ChronicleLog:FlushToFile()
+-- PERF: the file content is exactly the same as before, but
+--   * the header and the lines are appended separately instead of building
+--     header .. "\n" .. content .. "\n" (two extra copies of the whole buffer);
+--   * a combat-end auto save (deferred = true) hands the buffer to a background
+--     writer that appends FLUSH_CHUNK_LINES lines per frame. Any other save
+--     (loading screen, logout, /reload, /chron save, file change...) first
+--     finishes that pending write, so the order of the lines is unchanged.
+function ChronicleLog:FlushToFile(deferred)
+    self:FinishPendingFlush()
     if self.bufferSize == 0 then
         return 0
     end
@@ -374,21 +399,58 @@ function ChronicleLog:FlushToFile()
     -- Generate filename based on character name and realm
     local filename = self:GetLogFilename()
     
-    -- Join buffer lines with newlines, prepend header
-    local bufferContent = table.concat(self.buffer, "\n")
-    local newContent = header .. "\n" .. bufferContent .. "\n"
-    
-    -- Append content to file (creates file if doesn't exist)
-    local ok, err = ChronicleFile:AppendToFile(filename, newContent)
+    local written = self.bufferSize
+    local ok, err = ChronicleFile:AppendToFile(filename, header .. "\n")
     if ok then
-        Chronicle:DebugPrint("Appended " .. self.bufferSize .. " lines to " .. filename)
+        if deferred then
+            self.pendingFlush = { lines = self.buffer, n = written, pos = 1, filename = filename }
+            self.buffer = {}
+            self.bufferSize = 0
+        else
+            -- an empty last element gives the trailing newline without a copy
+            self.buffer[written + 1] = ""
+            ok, err = ChronicleFile:AppendToFile(filename, table.concat(self.buffer, "\n", 1, written + 1))
+        end
+    end
+    if ok then
+        Chronicle:DebugPrint("Appended " .. written .. " lines to " .. filename)
     else
         Chronicle:Print("Failed to write: " .. (err or "unknown error"))
     end
     
-    local written = self.bufferSize
-    self:ClearBuffer()
+    if not self.pendingFlush or not deferred then
+        self:ClearBuffer()
+    end
     return written
+end
+
+--- Appends up to `maxLines` lines of the pending (deferred) save.
+function ChronicleLog:DrainPendingFlush(maxLines)
+    local p = self.pendingFlush
+    if not p then return end
+    local last = p.pos + maxLines - 1
+    if last >= p.n then
+        -- last chunk: an empty extra element gives the trailing newline
+        last = p.n
+        p.lines[last + 1] = ""
+        last = last + 1
+    end
+    local ok, err = ChronicleFile:AppendToFile(p.filename, table.concat(p.lines, "\n", p.pos, last)
+        .. (last > p.n and "" or "\n"))
+    if not ok then
+        Chronicle:Print("Failed to write: " .. (err or "unknown error"))
+    end
+    p.pos = last + 1
+    if p.pos > p.n then
+        self.pendingFlush = nil
+    end
+end
+
+--- Writes what is left of a pending (deferred) save right away.
+function ChronicleLog:FinishPendingFlush()
+    while self.pendingFlush do
+        self:DrainPendingFlush(1000000)
+    end
 end
 
 -- =============================================================================
@@ -1493,7 +1555,7 @@ end
 --- Handles PLAYER_LEAVING_WORLD events.
 --- Flushes the log buffer to file on logout/disconnect/reload.
 function ChronicleLog:PLAYER_LEAVING_WORLD()
-    if self.bufferSize > 0 then
+    if self.bufferSize > 0 or self.pendingFlush then
         self:FlushToFile()
     end
 end

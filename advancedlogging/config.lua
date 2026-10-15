@@ -550,6 +550,7 @@ end
 --- Archives current logs to a backup file with the given suffix, then clears logs.
 --- @param suffix string - suffix for the backup filename (e.g. "backup" or a user-entered label)
 function ChronicleLog:ArchiveLogs(suffix)
+    self:FinishPendingFlush()
     local currentFile = self:GetLogFilename()
     local timestamp = time()
     -- Derive backup name from the current filename (respects includeRealmInFilename)
@@ -576,6 +577,7 @@ end
 
 --- Deletes all current logs (disk and memory).
 function ChronicleLog:DeleteLogs()
+    self.pendingFlush = nil
     local filename = self:GetLogFilename()
     ChronicleFile:WriteFile(filename, "")
     self:ClearBuffer()
