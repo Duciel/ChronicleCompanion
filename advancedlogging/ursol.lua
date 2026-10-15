@@ -79,7 +79,26 @@ local DEFAULTS = {
     threatLimit = 10,
 }
 
+-- Fork only: settings saved by 0.38.1-0.38.6 used an "octo_" prefix; they are
+-- moved to "ursol_" once, the first time a setting is read.
+local migrated = false
+local function MigrateOctoSettings()
+    migrated = true
+    local db = ChronicleCompanionDB and ChronicleCompanionDB.advancedLog
+    if not db then return end
+    local moved = {}
+    for k, v in pairs(db) do
+        if type(k) == "string" and strsub(k, 1, 5) == "octo_" then moved[k] = v end
+    end
+    for k, v in pairs(moved) do
+        local key = "ursol_" .. strsub(k, 6)
+        if db[key] == nil then db[key] = v end
+        db[k] = nil
+    end
+end
+
 function Ursol:Get(key)
+    if not migrated then MigrateOctoSettings() end
     local db = ChronicleCompanionDB and ChronicleCompanionDB.advancedLog
     if db and db["ursol_" .. key] ~= nil then
         return db["ursol_" .. key]

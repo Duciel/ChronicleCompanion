@@ -137,7 +137,7 @@ function Chronicle:HandleSlashCommand(msg)
 		else
 			self:Print("Minimap icon hidden. Type /chronicle minimap to show it again.")
 		end
-	elseif cmd == "ursol" then
+	elseif cmd == "ursol" or cmd == "octo" then -- "octo": name used by 0.38.1-0.38.6
 		ChronicleUrsol:Slash(parts[2], parts[3])
 	else
 		ChronicleLog:OpenOptionsPanel()
