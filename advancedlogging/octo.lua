@@ -835,7 +835,9 @@ local THREAT_QUERY_NEXT = { auto = "on", on = "off", off = "auto" }
 function Octo:CreateOptions(panel)
     local side = CreateFrame("Frame", "ChronicleOctoOptions", panel)
     side:SetWidth(230)
-    side:SetHeight(panel:GetHeight())
+    -- a bit taller than the options window: room for the six checkboxes and the
+    -- detected APIs without the last lines overlapping
+    side:SetHeight(panel:GetHeight() + 40)
     side:SetPoint("TOPLEFT", panel, "TOPRIGHT", -4, 0)
     side:SetBackdrop({
         bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -904,7 +906,8 @@ function Octo:CreateOptions(panel)
     side.apiText = apiText
 
     local help = side:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-    help:SetPoint("BOTTOMLEFT", 20, 20)
+    -- right under the detected APIs (never on top of them, whatever the font size)
+    help:SetPoint("TOPLEFT", apiText, "BOTTOMLEFT", 0, -10)
     help:SetWidth(195)
     help:SetJustifyH("LEFT")
     help:SetText("Intervals: /chronicle octo\nFormat: OCTO_EVENTS.md")
