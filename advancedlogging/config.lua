@@ -309,25 +309,25 @@ function ChronicleLog:CreateOptionsPanel()
     local npVerText = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     npVerText:SetPoint("LEFT", npVerLabel, "RIGHT", 5, 0)
     panel.npVerText = npVerText
-    
+
     yLeft = yLeft - 14
-    
+
     local caVerLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     caVerLabel:SetPoint("TOPLEFT", leftCol, yLeft)
     caVerLabel:SetText("ClassicAPI:")
     local caVerText = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     caVerText:SetPoint("LEFT", caVerLabel, "RIGHT", 5, 0)
     panel.caVerText = caVerText
-    
+
     yLeft = yLeft - 14
-    
+
     local swVerLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     swVerLabel:SetPoint("TOPLEFT", leftCol, yLeft)
     swVerLabel:SetText("SuperWoW:")
     local swVerText = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     swVerText:SetPoint("LEFT", swVerLabel, "RIGHT", 5, 0)
     panel.swVerText = swVerText
-    
+
     yLeft = yLeft - 22
     
     -- =========================================================================

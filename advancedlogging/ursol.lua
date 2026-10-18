@@ -485,7 +485,7 @@ function Ursol:WriteUnitState(guid, unit)
     self.lastData[guid] = keep
     data = keep
     ChronicleLog:CheckUnit(guid)
-    ChronicleLog:Write("UNIT_STATE", guid, data.hp, data.maxHp,
+    ChronicleLog:Write10("UNIT_STATE", guid, data.hp, data.maxHp,
         data.power or "", data.maxPower or "", data.powerType or "",
         data.map or "", data.x or "", data.y or "", data.z or "")
 end
@@ -556,12 +556,12 @@ function Ursol:CheckCombat(guid)
     if inCombat then
         if not was then
             ChronicleLog:CheckUnit(guid)
-            ChronicleLog:Write("UNIT_COMBAT", guid, 1)
+            ChronicleLog:Write2("UNIT_COMBAT", guid, 1)
         end
         self.inCombat[guid] = GetTime()
     elseif was then
         self.inCombat[guid] = nil
-        ChronicleLog:Write("UNIT_COMBAT", guid, 0)
+        ChronicleLog:Write2("UNIT_COMBAT", guid, 0)
     end
 end
 
@@ -592,7 +592,7 @@ function Ursol:PollTargets()
                 -- nil means the unit is out of range / gone: keep the last known value
                 if SafeField(guid, "health") then
                     self.lastTarget[guid] = target
-                    ChronicleLog:Write("UNIT_TARGET", guid, target)
+                    ChronicleLog:Write2("UNIT_TARGET", guid, target)
                 end
             end
         end
@@ -652,7 +652,7 @@ function Ursol:ScanMarks()
         self.missingMarks[guid] = nil
         if self.marks[guid] ~= index then
             ChronicleLog:CheckUnit(guid)
-            ChronicleLog:Write("RAID_MARK", guid, index)
+            ChronicleLog:Write2("RAID_MARK", guid, index)
         end
     end
     -- A unit can briefly drop out of a scan (seen in game: set / removed / set
@@ -663,7 +663,7 @@ function Ursol:ScanMarks()
             local misses = (self.missingMarks[guid] or 0) + 1
             if (used[index] and used[index] ~= guid) or misses >= 2 then
                 self.missingMarks[guid] = nil
-                ChronicleLog:Write("RAID_MARK", guid, 0)
+                ChronicleLog:Write2("RAID_MARK", guid, 0)
             else
                 self.missingMarks[guid] = misses
                 current[guid] = index
@@ -733,7 +733,7 @@ function Ursol:WriteThreat(mobGuid, mobName, source, list)
     if last and last.list == list and (now - last.time) < 1.5 then return end
     self.lastThreat[key] = { list = list, time = now }
     if mobGuid ~= "" then ChronicleLog:CheckUnit(mobGuid) end
-    ChronicleLog:Write("THREAT", mobGuid, mobName or "", source, list)
+    ChronicleLog:Write4("THREAT", mobGuid, mobName or "", source, list)
 end
 
 --- Server answer to a TWT_UDTSv4[_TM] request sent by this client (any addon).
@@ -759,7 +759,7 @@ function Ursol:HandleServerThreat(message)
         if te then
             local list = strsub(tankPart, te + 1)
             if list ~= "" then
-                ChronicleLog:Write("THREAT_TANK", "self", RoundThreatList(list))
+                ChronicleLog:Write2("THREAT_TANK", "self", RoundThreatList(list))
             end
         end
     end
@@ -795,7 +795,7 @@ function ChronicleLog:CHAT_MSG_ADDON(prefix, message, channel, sender)
             if strsub(message, 1, strlen(TANKSHARE_API)) == TANKSHARE_API then
                 local list = strsub(message, strlen(TANKSHARE_API) + 1)
                 if list ~= "" then
-                    self:Write("THREAT_TANK", "relay:" .. sender, RoundThreatList(list))
+                    self:Write2("THREAT_TANK", "relay:" .. sender, RoundThreatList(list))
                 end
                 return
             end
