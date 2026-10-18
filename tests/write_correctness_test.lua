@@ -2,6 +2,7 @@ GetBuildInfo = function()
     return "1.12.1", "5875", ""
 end
 
+dofile("util.lua")
 dofile("advancedlogging/core.lua")
 
 GetTime = function()
