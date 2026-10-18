@@ -73,4 +73,22 @@ assertEquivalent("Write12",
     function() ChronicleLog:Write("BENCH12", "one", 2, true, nil, "five", 6.25, false, "", "nine|pipe", 10, 11, 12) end,
     function() ChronicleLog:Write12("BENCH12", "one", 2, true, nil, "five", 6.25, false, "", "nine|pipe", 10, 11, 12) end)
 
+
+-- The merged Ursol schema appends mapId as the sixth ZONE_INFO field. Verify
+-- WriteZoneInfo preserves that field while using the fixed-arity writer.
+resetBuffer()
+strlower = string.lower
+ChronicleCompanionCharDB = { lastInstanceIds = {} }
+GetRealZoneText = function() return "Zul'Gurub" end
+GetNumSavedInstances = function() return 0 end
+UnitIsGhost = function() return nil end
+GetInstanceInfo = function()
+    return "Zul'Gurub", "raid", 20, "Raid", 40, 0, false, 309
+end
+ChronicleLog.IsInInstance = function() return true, "raid" end
+ChronicleLog.WriteHeader = function() end
+ChronicleLog:WriteZoneInfo(true)
+assert(ChronicleLog.buffer[1] == "1002000|ZONE_INFO|Zul'Gurub||1|raid|0|309",
+    "ZONE_INFO must append the ClassicAPI mapId")
+
 print("write correctness tests passed")
