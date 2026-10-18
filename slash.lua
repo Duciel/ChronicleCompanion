@@ -116,12 +116,17 @@ function Chronicle:HandleSlashCommand(msg)
 			-- No arg or invalid arg: toggle
 			newVal = not ChronicleLog:GetSetting("includeRealmInFilename")
 		end
+		-- Flush pending lines to the current file before the name changes
+		ChronicleLog:FlushToFile()
 		ChronicleLog:SetSetting("includeRealmInFilename", newVal)
+		ChronicleLog.currentLogFile = nil
 		if newVal then
 			self:Print("Log files now separated per realm. Current file: " .. ChronicleLog:GetLogFilename())
 		else
 			self:Print("Log files no longer separated per realm. Current file: " .. ChronicleLog:GetLogFilename())
 		end
+	elseif cmd == "file" then
+		self:Print("Current log file: " .. ChronicleLog:GetLogFilename())
 	elseif cmd == "minimap" then
 		local current = ChronicleLog:GetSetting("showMinimapIcon")
 		local newVal = not current
@@ -132,6 +137,8 @@ function Chronicle:HandleSlashCommand(msg)
 		else
 			self:Print("Minimap icon hidden. Type /chronicle minimap to show it again.")
 		end
+	elseif cmd == "ursol" or cmd == "octo" then -- "octo": name used by 0.38.1-0.38.6
+		ChronicleUrsol:Slash(parts[2], parts[3])
 	else
 		ChronicleLog:OpenOptionsPanel()
 	end
@@ -146,8 +153,10 @@ function Chronicle:ShowHelp()
 	self:Print("/chronicle config - Open options panel")
 	self:Print("/chronicle ids - Show saved instance IDs")
 	self:Print("/chronicle inspect <name> - Force talent inspection of a player")
+	self:Print("/chronicle ursol [setting] [value] - Extra events (unitState, position, target, combat, marks, threat)")
 	self:Print("/chronicle minimap - Toggle minimap icon visibility")
 	self:Print("/chronicle realm [1|0|true|false] - Toggle or set per-realm log file separation")
+	self:Print("/chronicle file - Show the current log file (one per character, instance and day)")
 	self:Print("/chronicle help - Show this help")
 	self:Print("/clog - Open chronicle log options")
 end

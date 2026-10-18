@@ -10,6 +10,12 @@ ChronicleLog = {
     frame = nil,
     buffer = {},       -- In-memory buffer for log lines
     bufferSize = 0,    -- Current number of lines in buffer
+    raidGroupPayload = nil,
+    raidGroupCapturePending = false,
+    raidGroupCaptureAt = nil,
+    raidGroupCaptureReason = nil,
+    raidGroupForceCapture = false,
+    raidGroupRetryCount = 0,
 }
 
 -- Detect Turtle WoW (build 7272) vs vanilla 1.12 (build 5875)
@@ -21,18 +27,134 @@ ChronicleLog.isTurtleWow = (tonumber(wowBuild) == 7272)
 -- Delimiter for log output format: TIMESTAMP|EVENT_TYPE|field1|field2|...
 local LOG_SEP = "|"
 
---- Generate log filename for the current character.
---- Format: Chronicle_<CharacterName>.txt, or Chronicle_<CharacterName>_<RealmName>.txt
---- when the includeRealmInFilename setting is enabled (account-wide). Including the
---- realm differentiates same-named characters on different realms.
----@return string filename The log filename
-function ChronicleLog:GetLogFilename()
+-- PERF (local change): lines written per frame by a deferred combat-end save
+local FLUSH_CHUNK_LINES = 1000
+
+local RAID_GROUP_DEBOUNCE_DELAY = 0.25
+local RAID_GROUP_RETRY_DELAY = 0.25
+local RAID_GROUP_MAX_RETRIES = 8
+
+-- A raid session keeps the same file (and date) as long as we come back to the
+-- same instance within this delay. A raid starting at 23:00 and ending at 01:00
+-- (or a /reload / disconnect in the middle) therefore stays in one file, dated
+-- from the day the raid started.
+local SESSION_TIMEOUT = 6 * 3600 -- seconds
+-- "Raid day" starts at 06:00: anything between midnight and 06:00 belongs to the
+-- previous evening (e.g. Onyxia entered at 00:30 after a Molten Core started at 21:00).
+local DAY_START_OFFSET = 6 * 3600 -- seconds
+
+--- Strips everything but letters and digits ("Zul'Gurub" -> "ZulGurub",
+--- "Onyxia's Lair" -> "OnyxiasLair") so the name is safe in a filename.
+local function SanitizeForFilename(text)
+    local clean = string.gsub(text or "", "[^%w]", "")
+    return clean
+end
+
+--- Returns the instance ID of the current zone from the saved instances list (0 if not saved).
+local function GetCurrentInstanceId(zoneName)
+    local zoneLower = strlower(zoneName or "")
+    for i = 1, GetNumSavedInstances() do
+        local instanceName, savedId = GetSavedInstanceInfo(i)
+        if instanceName and zoneLower == strlower(instanceName) then
+            return savedId or 0
+        end
+    end
+    return 0
+end
+
+--- Base of every filename: Chronicle_<CharacterName> or Chronicle_<CharacterName>_<RealmName>
+--- when the includeRealmInFilename setting is enabled (account-wide).
+function ChronicleLog:GetFilenameBase()
     local playerName = UnitName("player") or "Unknown"
     if self:GetSetting("includeRealmInFilename") then
-        local realm = GetRealmName() or "Unknown"
-        return "Chronicle_" .. playerName .. "_" .. realm .. ".txt"
+        local realm = SanitizeForFilename(GetRealmName() or "Unknown")
+        return "Chronicle_" .. playerName .. "_" .. realm
     end
-    return "Chronicle_" .. playerName .. ".txt"
+    return "Chronicle_" .. playerName
+end
+
+--- Computes the filename that matches the current location.
+--- In a raid or dungeon: Chronicle_<Name>_<Instance>_<YYYY-MM-DD>.txt, where the date
+--- is the day the session started (see SESSION_TIMEOUT).
+--- Elsewhere: Chronicle_<Name>.txt (previous behaviour).
+---@return string filename
+function ChronicleLog:ComputeLogFilename()
+    local base = self:GetFilenameBase()
+    local inInstance = self:IsInInstance()
+    local zoneName = GetRealZoneText() or ""
+    local zoneKey = SanitizeForFilename(zoneName)
+
+    if not inInstance or zoneKey == "" then
+        return base .. ".txt"
+    end
+
+    if not ChronicleCompanionCharDB then ChronicleCompanionCharDB = {} end
+    local session = ChronicleCompanionCharDB.logSession
+    local now = time()
+    local instanceId = GetCurrentInstanceId(zoneName)
+
+    local sameSession = session
+        and session.zone == zoneKey
+        and session.date
+        and session.last
+        and (now - session.last) < SESSION_TIMEOUT
+        -- A different raid lockout means a different raid, even within the delay
+        and not (instanceId ~= 0 and session.instanceId and session.instanceId ~= 0 and session.instanceId ~= instanceId)
+
+    if not sameSession then
+        session = { zone = zoneKey, date = date("%Y-%m-%d", now - DAY_START_OFFSET), instanceId = instanceId }
+        ChronicleCompanionCharDB.logSession = session
+    end
+    session.last = now
+    if instanceId ~= 0 then
+        session.instanceId = instanceId
+    end
+
+    return base .. "_" .. zoneKey .. "_" .. session.date .. ".txt"
+end
+
+--- Keeps the session alive (called on every flush) so that a long raid
+--- is not split even if no zone change happens for hours.
+function ChronicleLog:TouchLogSession()
+    local session = ChronicleCompanionCharDB and ChronicleCompanionCharDB.logSession
+    if session and self.currentLogFile and string.find(self.currentLogFile, "_" .. session.zone .. "_", 1, true) then
+        session.last = time()
+    end
+end
+
+--- Returns the file currently being written to.
+--- The name is fixed when the zone changes (see ZONE_CHANGED_NEW_AREA), so lines
+--- buffered in a raid are still written to that raid's file after a loading screen.
+---@return string filename The log filename
+function ChronicleLog:GetLogFilename()
+    if not self.currentLogFile then
+        self.currentLogFile = self:ComputeLogFilename()
+    end
+    return self.currentLogFile
+end
+
+--- Recomputes the target file for the current zone. If it changed, the buffer
+--- is first flushed to the previous file.
+function ChronicleLog:UpdateLogFilename()
+    local newFile = self:ComputeLogFilename()
+    local now = GetTime()
+    if self.currentLogFile and newFile ~= self.currentLogFile then
+        -- Right after a loading screen the client may still report the previous
+        -- zone name for a fraction of a second (e.g. "Stranglethorn Vale" flagged
+        -- as a raid before "Zul'Gurub"). A file selected less than a few seconds
+        -- ago is treated as transitional: its lines go to the new file instead.
+        local transitional = self.currentLogFileSince and (now - self.currentLogFileSince) < 5
+        if not transitional then
+            self:FlushToFile()
+        end
+        if self:IsEnabled() then
+            Chronicle:Print("Log file: " .. newFile)
+        end
+    end
+    if newFile ~= self.currentLogFile then
+        self.currentLogFileSince = now
+    end
+    self.currentLogFile = newFile
 end
 
 --- Wrapper for IsInInstance() that excludes battlegrounds.
@@ -108,7 +230,9 @@ ChronicleLog.events = {
     -- Unit GUID events
     "UNIT_INVENTORY_CHANGED_GUID", -- Unit equipment changed (emits COMBATANT_INFO)
 
-    -- Raid target events
+    -- Raid events
+    "RAID_ROSTER_UPDATE",          -- Raid membership or subgroup assignment changed
+    "PARTY_MEMBERS_CHANGED",       -- Covers raid conversion and disband transitions
     -- "RAID_TARGET_UPDATE",       -- Raid target icon changed on a unit (no payload, needs GetRaidTargetIndex)
 }
 
@@ -130,8 +254,14 @@ function ChronicleLog:Init()
     self.frame = CreateFrame("Frame", "ChronicleLogFrame")
     local lastTransmogCheck = 0
     self.frame:SetScript("OnUpdate", function()
-        -- Throttle: only check every 0.5 seconds
         local now = GetTime()
+        -- PERF (local change): write a deferred combat-end save a few lines per frame
+        if ChronicleLog.pendingFlush then
+            ChronicleLog:DrainPendingFlush(FLUSH_CHUNK_LINES)
+        end
+        ChronicleLog:ProcessScheduledRaidGroupCapture(now)
+
+        -- Throttle transmog and talent work to every 0.5 seconds
         if (now - lastTransmogCheck) < 0.5 then return end
         lastTransmogCheck = now
         
@@ -149,8 +279,11 @@ function ChronicleLog:Init()
     self.frame:SetScript("OnEvent", function()
         local autoSave = (event == "PLAYER_REGEN_ENABLED" and self:GetSetting("autoCombatSave"))
         -- Always process zone changes (for auto-enable/disable even when logging is off)
-        if event == "PLAYER_ENTERING_WORLD" or autoSave then
+        if event == "PLAYER_ENTERING_WORLD" then
             ChronicleLog:FlushToFile()
+        elseif autoSave then
+            -- PERF (local change): spread over the next frames instead of one freeze
+            ChronicleLog:FlushToFile(true)
         end
 
         if event == "ZONE_CHANGED_NEW_AREA" or event == "PLAYER_ENTERING_WORLD" then
@@ -199,6 +332,10 @@ function ChronicleLog:Enable()
     for _, evt in ipairs(self.events) do
         self.frame:RegisterEvent(evt)
     end
+
+    -- Capture the current raid as a fresh logging-session baseline.
+    self:ResetRaidGroupCapture()
+    self:ScheduleRaidGroupCapture(0, "LOGGING_ENABLED")
     
     -- Update minimap icon
     if ChronicleMinimapButton then
@@ -218,6 +355,8 @@ function ChronicleLog:Disable()
     for _, evt in ipairs(self.events) do
         self.frame:UnregisterEvent(evt)
     end
+
+    self:ResetRaidGroupCapture()
     
     -- Write buffer to file on disable
     local linesWritten = self:FlushToFile()
@@ -249,7 +388,10 @@ end
 -- =============================================================================
 
 --- Generates a header string with player and version metadata.
---- Format: HEADER|playerGuid|realm|zone|addonVer|superWowVer|namPowerVer|xp3Ver|wowVer|wowBuild|wowBuildDate|localTime|utcTime|combatLogRange|clientType
+--- Format: HEADER|playerGuid|realm|zone|addonVer|superWowVer|namPowerVer|xp3Ver|wowVer|wowBuild|wowBuildDate|localTime|utcTime|combatLogRange|classicApi|threatMode
+--- classicApi: ClassicAPI version ("X.Y.Z" from CLASSIC_API_VERSION), empty when not loaded.
+--- threatMode: "query" (this addon asks the server for threat), "listen" (another
+--- threat addon asks, this addon records the answers) or "" (threat logging off).
 ---@return string header Pipe-delimited header line
 function ChronicleLog:GenerateHeader()
     -- Player info
@@ -260,7 +402,7 @@ function ChronicleLog:GenerateHeader()
     
     -- Addon versions
     local addonVersion = GetAddOnMetadata("ChronicleCompanion", "Version") or ""
-    local superWowVersion = ""
+    local superWowVersion = SUPERWOW_VERSION or ""
     local namPowerVersion = NAMPOWER_VERSION or ""
     
     local xp3Version = ""
@@ -278,6 +420,13 @@ function ChronicleLog:GenerateHeader()
     
     -- Combat log range
     local combatLogRange = GetCVar("CombatLogRangeCreature") or ""
+
+    -- Client mods and threat logging mode (see advancedlogging/ursol.lua)
+    local classicApi = Chronicle_ClassicAPIVersion()
+    local threatMode = ""
+    if ChronicleUrsol and ChronicleUrsol:Get("threat") then
+        threatMode = ChronicleUrsol:ThreatQueryActive() and "query" or "listen"
+    end
     
     local parts = {
         "HEADER",
@@ -293,7 +442,9 @@ function ChronicleLog:GenerateHeader()
         wowBuildDate,
         localTime,
         utcTime,
-        combatLogRange
+        combatLogRange,
+        classicApi,
+        threatMode
     }
     
     return table.concat(parts, LOG_SEP)
@@ -312,19 +463,106 @@ end
 --- Uses Lua 5.0 vararg style (arg table) for Vanilla WoW compatibility.
 --- Buffer is written to file when logging is disabled via ChronicleLog:Disable().
 ---@param eventType string Event type code (SWING, CAST, DEATH, COMBAT_START, COMBAT_END, RAW)
+-- PERF (local change): one reused table assembles every line (was a new table per line)
+local writeParts = {}
+
 function ChronicleLog:Write(eventType, ...)
     -- Millisecond timestamp: combine GetTime() precision with unix offset
     local timestamp = math.floor((GetTime() + self.timeOffset) * 1000)
-    local parts = { timestamp, eventType }
+    local parts = writeParts
+    parts[1] = timestamp
+    parts[2] = eventType
+    local count = 2
     for i = 1, arg.n do
         local v = arg[i]
-        parts[table.getn(parts) + 1] = v ~= nil and tostring(v) or ""
+        count = count + 1
+        parts[count] = v ~= nil and tostring(v) or ""
     end
-    local line = table.concat(parts, LOG_SEP)
+    local line = table.concat(parts, LOG_SEP, 1, count)
     
     -- Append to in-memory buffer
     self.bufferSize = self.bufferSize + 1
     self.buffer[self.bufferSize] = line
+end
+
+-- -----------------------------------------------------------------------------
+-- Fixed-arity writers: ChronicleLog:WriteN(eventType, a1, ..., aN)
+--
+-- Same output as ChronicleLog:Write, byte for byte, but without the Lua 5.0
+-- vararg table ("arg") that every call to a function declared with "..."
+-- allocates, and without assembling the line in a table: the line is built
+-- with a single ".." chain. Write() is kept for callers outside the hot paths.
+-- N is the number of fields after the event type, counted exactly like
+-- arg.n in Write: a trailing nil argument still writes an empty field.
+-- -----------------------------------------------------------------------------
+
+--- Text of one field, as Write() would produce it (nil -> "").
+--- Strings and numbers are returned as they are: ".." formats numbers exactly
+--- like tostring() does.
+local function F(v)
+    if v == nil then return "" end
+    local t = type(v)
+    if t == "string" or t == "number" then return v end
+    return tostring(v)
+end
+
+local floor = math.floor
+
+local function Push(self, line)
+    self.bufferSize = self.bufferSize + 1
+    self.buffer[self.bufferSize] = line
+end
+
+function ChronicleLog:Write0(eventType)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType)
+end
+
+function ChronicleLog:Write1(eventType, a1)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1))
+end
+
+function ChronicleLog:Write2(eventType, a1, a2)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1) .. LOG_SEP .. F(a2))
+end
+
+function ChronicleLog:Write3(eventType, a1, a2, a3)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1) .. LOG_SEP .. F(a2) .. LOG_SEP .. F(a3))
+end
+
+function ChronicleLog:Write4(eventType, a1, a2, a3, a4)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1) .. LOG_SEP .. F(a2) .. LOG_SEP .. F(a3) .. LOG_SEP .. F(a4))
+end
+
+function ChronicleLog:Write5(eventType, a1, a2, a3, a4, a5)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1) .. LOG_SEP .. F(a2) .. LOG_SEP .. F(a3) .. LOG_SEP .. F(a4) .. LOG_SEP .. F(a5))
+end
+
+function ChronicleLog:Write6(eventType, a1, a2, a3, a4, a5, a6)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1) .. LOG_SEP .. F(a2) .. LOG_SEP .. F(a3) .. LOG_SEP .. F(a4) .. LOG_SEP .. F(a5) .. LOG_SEP .. F(a6))
+end
+
+function ChronicleLog:Write7(eventType, a1, a2, a3, a4, a5, a6, a7)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1) .. LOG_SEP .. F(a2) .. LOG_SEP .. F(a3) .. LOG_SEP .. F(a4) .. LOG_SEP .. F(a5) .. LOG_SEP .. F(a6) .. LOG_SEP .. F(a7))
+end
+
+function ChronicleLog:Write8(eventType, a1, a2, a3, a4, a5, a6, a7, a8)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1) .. LOG_SEP .. F(a2) .. LOG_SEP .. F(a3) .. LOG_SEP .. F(a4) .. LOG_SEP .. F(a5) .. LOG_SEP .. F(a6) .. LOG_SEP .. F(a7) .. LOG_SEP .. F(a8))
+end
+
+function ChronicleLog:Write9(eventType, a1, a2, a3, a4, a5, a6, a7, a8, a9)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1) .. LOG_SEP .. F(a2) .. LOG_SEP .. F(a3) .. LOG_SEP .. F(a4) .. LOG_SEP .. F(a5) .. LOG_SEP .. F(a6) .. LOG_SEP .. F(a7) .. LOG_SEP .. F(a8) .. LOG_SEP .. F(a9))
+end
+
+function ChronicleLog:Write10(eventType, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1) .. LOG_SEP .. F(a2) .. LOG_SEP .. F(a3) .. LOG_SEP .. F(a4) .. LOG_SEP .. F(a5) .. LOG_SEP .. F(a6) .. LOG_SEP .. F(a7) .. LOG_SEP .. F(a8) .. LOG_SEP .. F(a9) .. LOG_SEP .. F(a10))
+end
+
+function ChronicleLog:Write11(eventType, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1) .. LOG_SEP .. F(a2) .. LOG_SEP .. F(a3) .. LOG_SEP .. F(a4) .. LOG_SEP .. F(a5) .. LOG_SEP .. F(a6) .. LOG_SEP .. F(a7) .. LOG_SEP .. F(a8) .. LOG_SEP .. F(a9) .. LOG_SEP .. F(a10) .. LOG_SEP .. F(a11))
+end
+
+function ChronicleLog:Write12(eventType, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12)
+    Push(self, floor((GetTime() + self.timeOffset) * 1000) .. LOG_SEP .. eventType .. LOG_SEP .. F(a1) .. LOG_SEP .. F(a2) .. LOG_SEP .. F(a3) .. LOG_SEP .. F(a4) .. LOG_SEP .. F(a5) .. LOG_SEP .. F(a6) .. LOG_SEP .. F(a7) .. LOG_SEP .. F(a8) .. LOG_SEP .. F(a9) .. LOG_SEP .. F(a10) .. LOG_SEP .. F(a11) .. LOG_SEP .. F(a12))
 end
 
 --- Clears the in-memory buffer.
@@ -343,7 +581,15 @@ end
 --- Appends to existing file content using native append mode.
 --- Filename: see ChronicleLog:GetLogFilename()
 ---@return number linesWritten Number of new lines written
-function ChronicleLog:FlushToFile()
+-- PERF (local change): the file content is exactly the same as before, but
+--   * the header and the lines are appended separately instead of building
+--     header .. "\n" .. content .. "\n" (two extra copies of the whole buffer);
+--   * a combat-end auto save (deferred = true) hands the buffer to a background
+--     writer that appends FLUSH_CHUNK_LINES lines per frame. Any other save
+--     (loading screen, logout, /reload, /chron save, file change...) first
+--     finishes that pending write, so the order of the lines is unchanged.
+function ChronicleLog:FlushToFile(deferred)
+    self:FinishPendingFlush()
     if self.bufferSize == 0 then
         return 0
     end
@@ -354,21 +600,185 @@ function ChronicleLog:FlushToFile()
     -- Generate filename based on character name and realm
     local filename = self:GetLogFilename()
     
-    -- Join buffer lines with newlines, prepend header
-    local bufferContent = table.concat(self.buffer, "\n")
-    local newContent = header .. "\n" .. bufferContent .. "\n"
-    
-    -- Append content to file (creates file if doesn't exist)
-    local ok, err = ChronicleFile:AppendToFile(filename, newContent)
+    local written = self.bufferSize
+    local ok, err = ChronicleFile:AppendToFile(filename, header .. "\n")
     if ok then
-        Chronicle:DebugPrint("Appended " .. self.bufferSize .. " lines to " .. filename)
+        if deferred then
+            self.pendingFlush = { lines = self.buffer, n = written, pos = 1, filename = filename }
+            self.buffer = {}
+            self.bufferSize = 0
+        else
+            -- an empty last element gives the trailing newline without a copy
+            self.buffer[written + 1] = ""
+            ok, err = ChronicleFile:AppendToFile(filename, table.concat(self.buffer, "\n", 1, written + 1))
+        end
+    end
+    self:TouchLogSession()
+    if ok then
+        Chronicle:DebugPrint("Appended " .. written .. " lines to " .. filename)
     else
         Chronicle:Print("Failed to write: " .. (err or "unknown error"))
     end
     
-    local written = self.bufferSize
-    self:ClearBuffer()
+    if not self.pendingFlush or not deferred then
+        self:ClearBuffer()
+    end
     return written
+end
+
+--- Appends up to `maxLines` lines of the pending (deferred) save.
+function ChronicleLog:DrainPendingFlush(maxLines)
+    local p = self.pendingFlush
+    if not p then return end
+    local last = p.pos + maxLines - 1
+    if last >= p.n then
+        -- last chunk: an empty extra element gives the trailing newline
+        last = p.n
+        p.lines[last + 1] = ""
+        last = last + 1
+    end
+    local ok, err = ChronicleFile:AppendToFile(p.filename, table.concat(p.lines, "\n", p.pos, last)
+        .. (last > p.n and "" or "\n"))
+    if not ok then
+        Chronicle:Print("Failed to write: " .. (err or "unknown error"))
+    end
+    p.pos = last + 1
+    if p.pos > p.n then
+        self.pendingFlush = nil
+    end
+end
+
+--- Writes what is left of a pending (deferred) save right away.
+function ChronicleLog:FinishPendingFlush()
+    while self.pendingFlush do
+        self:DrainPendingFlush(1000000)
+    end
+end
+
+-- =============================================================================
+-- Raid Group Composition
+-- =============================================================================
+
+--- Clears session-only raid composition state and cancels pending captures.
+function ChronicleLog:ResetRaidGroupCapture()
+    self.raidGroupPayload = nil
+    self.raidGroupCapturePending = false
+    self.raidGroupCaptureAt = nil
+    self.raidGroupCaptureReason = nil
+    self.raidGroupForceCapture = false
+    self.raidGroupRetryCount = 0
+end
+
+--- Schedules a raid composition capture on this frame or after a short delay.
+---@param delay number Delay in seconds
+---@param reason string Event that requested the snapshot
+---@param force boolean Whether to emit a complete raid snapshot even if unchanged
+function ChronicleLog:ScheduleRaidGroupCapture(delay, reason, force)
+    if not self.enabled then return end
+
+    local captureAt = GetTime() + (delay or 0)
+    if not self.raidGroupCapturePending or not self.raidGroupCaptureAt or captureAt < self.raidGroupCaptureAt then
+        self.raidGroupCaptureAt = captureAt
+    end
+    self.raidGroupCapturePending = true
+    self.raidGroupCaptureReason = reason or self.raidGroupCaptureReason or "UNKNOWN"
+    if force then
+        self.raidGroupForceCapture = true
+    end
+end
+
+--- Debounces a burst of roster events until no new event arrives during the delay.
+---@param delay number Delay in seconds
+---@param reason string Event that requested the snapshot
+function ChronicleLog:DebounceRaidGroupCapture(delay, reason)
+    if not self.enabled then return end
+
+    self.raidGroupCapturePending = true
+    self.raidGroupCaptureAt = GetTime() + (delay or 0)
+    self.raidGroupCaptureReason = reason or "UNKNOWN"
+end
+
+--- Runs a scheduled raid composition capture when its deadline is reached.
+---@param now number Current GetTime() value
+function ChronicleLog:ProcessScheduledRaidGroupCapture(now)
+    if not self.raidGroupCapturePending or not self.raidGroupCaptureAt then return end
+    if now < self.raidGroupCaptureAt then return end
+
+    local reason = self.raidGroupCaptureReason or "UNKNOWN"
+    local force = self.raidGroupForceCapture
+    self.raidGroupCapturePending = false
+    self.raidGroupCaptureAt = nil
+    self.raidGroupCaptureReason = nil
+    self.raidGroupForceCapture = false
+    self:CaptureRaidGroup(reason, force)
+end
+
+--- Builds a raid composition in ascending roster-index order.
+---@return string payload Semicolon-separated guid,raidIndex,subgroup,rank mappings, or nil while incomplete
+---@return number memberCount Current raid size
+---@return boolean inRaid Whether the player currently has raid members
+function ChronicleLog:BuildRaidGroupPayload()
+    local members = {}
+    local memberCount = GetNumRaidMembers() or 0
+
+    if memberCount <= 0 then
+        return "", 0, false
+    end
+
+    for raidIndex = 1, memberCount do
+        local name, rank, subgroup = GetRaidRosterInfo(raidIndex)
+        local guid = GetUnitGUID("raid" .. raidIndex)
+        if not name or rank == nil or not subgroup or subgroup < 1 or subgroup > 8 or not guid then
+            return nil, memberCount, true
+        end
+
+        members[raidIndex] = table.concat({ guid, raidIndex, subgroup, rank }, ",")
+    end
+
+    return table.concat(members, ";"), memberCount, true
+end
+
+--- Captures and emits the raid composition when changed or explicitly forced.
+---@param reason string Event that requested the snapshot
+---@param force boolean Whether to emit a complete raid snapshot even if unchanged
+function ChronicleLog:CaptureRaidGroup(reason, force)
+    if not self.enabled then return end
+
+    local payload, memberCount, inRaid = self:BuildRaidGroupPayload()
+    if not payload then
+        if inRaid and self.raidGroupRetryCount < RAID_GROUP_MAX_RETRIES then
+            self.raidGroupRetryCount = self.raidGroupRetryCount + 1
+            self:ScheduleRaidGroupCapture(RAID_GROUP_RETRY_DELAY, reason, force)
+        end
+        return
+    end
+
+    self.raidGroupRetryCount = 0
+    local snapshot = memberCount .. LOG_SEP .. payload
+
+    -- Do not write an empty baseline when logging starts outside a raid. If a
+    -- previously logged raid disbands, the changed empty snapshot is emitted once.
+    if not inRaid and self.raidGroupPayload == nil then
+        self.raidGroupPayload = snapshot
+        return
+    end
+
+    if snapshot ~= self.raidGroupPayload or (force and inRaid) then
+        self:Write3("RAID_COMPOSITION", reason, memberCount, payload)
+        self.raidGroupPayload = snapshot
+    end
+end
+
+--- Debounces raid roster bursts so only the final stable composition is captured.
+function ChronicleLog:RAID_ROSTER_UPDATE()
+    self.raidGroupRetryCount = 0
+    self:DebounceRaidGroupCapture(RAID_GROUP_DEBOUNCE_DELAY, "RAID_ROSTER_UPDATE")
+end
+
+--- Handles raid conversion and disband notifications through the same debounce path.
+function ChronicleLog:PARTY_MEMBERS_CHANGED()
+    self.raidGroupRetryCount = 0
+    self:DebounceRaidGroupCapture(RAID_GROUP_DEBOUNCE_DELAY, "PARTY_MEMBERS_CHANGED")
 end
 
 -- =============================================================================
@@ -382,7 +792,11 @@ function ChronicleLog:ZONE_CHANGED_NEW_AREA()
     if self.optionsPanel and self.optionsPanel:IsShown() then
         self.optionsPanel:Hide()
     end
-    
+
+    -- Switch to the file of the new zone (per character / instance / day).
+    -- Lines buffered before the zone change are flushed to the previous file first.
+    self:UpdateLogFilename()
+
     -- Get zone name and find instance ID from saved instances
     local zoneName = GetRealZoneText() or ""
     local zoneLower = strlower(zoneName)
@@ -465,6 +879,10 @@ function ChronicleLog:ZONE_CHANGED_NEW_AREA()
     self:WriteZoneInfo(true)
     if self:IsEnabled() then
         self:PurgeUnits()
+        if isRaid then
+            -- Zone boundaries need a complete snapshot even when the roster is unchanged.
+            self:ScheduleRaidGroupCapture(0, "ZONE_CHANGED_NEW_AREA", true)
+        end
     end
 end
 
@@ -504,8 +922,15 @@ function ChronicleLog:WriteZoneInfo(force)
     end
     
     self:WriteHeader()
-    -- The value after zoneName is the mapID, not the instance ID
-    self:Write("ZONE_INFO", zoneName, "", inInstanceNum, instanceType, isGhost)
+    -- The value after zoneName is Chronicle's internal instance ID slot: keep it empty.
+    -- mapId (Map.dbc id, e.g. 309 for Zul'Gurub) is appended as a new last field.
+    -- Only ClassicAPI exposes it (GetInstanceInfo, 8th value); empty otherwise.
+    local mapId = ""
+    if GetInstanceInfo then
+        local ok, _, _, _, _, _, _, _, id = pcall(GetInstanceInfo)
+        if ok and id then mapId = id end
+    end
+    self:Write6("ZONE_INFO", zoneName, "", inInstanceNum, instanceType, isGhost, mapId)
 end
 
 --- Updates the saved instance ID for the current zone.
@@ -537,7 +962,7 @@ end
 ---@param spellId number Spell ID
 ---@param duration number Cast duration in milliseconds
 function ChronicleLog:UNIT_CASTEVENT(casterGUID, targetGUID, eventType, spellId, duration)
-    self:Write("CAST", casterGUID, targetGUID, eventType, spellId, duration)
+    self:Write5("CAST", casterGUID, targetGUID, eventType, spellId, duration)
 end
 
 --- Handles UNIT_DIED events.
@@ -546,7 +971,7 @@ end
 ---@param guid string GUID of the unit that died
 function ChronicleLog:UNIT_DIED(guid)
     self:CheckUnit(guid)
-    self:Write("DEATH", guid)
+    self:Write1("DEATH", guid)
 end
 
 --- Handles RAID_TARGET_UPDATE events.
@@ -562,14 +987,14 @@ end
 --- Called when the player enters combat (loses regen).
 --- Writes a COMBAT_START event with no additional fields.
 function ChronicleLog:PLAYER_REGEN_DISABLED()
-    self:Write("COMBAT_START")
+    self:Write0("COMBAT_START")
 end
 
 --- Handles PLAYER_REGEN_ENABLED events.
 --- Called when the player leaves combat (regains regen).
 --- Writes a COMBAT_END event with no additional fields.
 function ChronicleLog:PLAYER_REGEN_ENABLED()
-    self:Write("COMBAT_END")
+    self:Write0("COMBAT_END")
     self:UpdateInstanceId()
 end
 
@@ -589,7 +1014,7 @@ end
 function ChronicleLog:AUTO_ATTACK_SELF(attackerGuid, targetGuid, totalDamage, hitInfo, victimState, subDamageCount, blockedAmount, totalAbsorb, totalResist)
     self:CheckUnit(attackerGuid)
     self:CheckUnit(targetGuid)
-    self:Write("SWING", attackerGuid, targetGuid, totalDamage, hitInfo, victimState, subDamageCount, blockedAmount, totalAbsorb, totalResist)
+    self:Write9("SWING", attackerGuid, targetGuid, totalDamage, hitInfo, victimState, subDamageCount, blockedAmount, totalAbsorb, totalResist)
 end
 
 --- Handles AUTO_ATTACK_OTHER events.
@@ -609,7 +1034,7 @@ end
 function ChronicleLog:AUTO_ATTACK_OTHER(attackerGuid, targetGuid, totalDamage, hitInfo, victimState, subDamageCount, blockedAmount, totalAbsorb, totalResist)
     self:CheckUnit(attackerGuid)
     self:CheckUnit(targetGuid)
-    self:Write("SWING", attackerGuid, targetGuid, totalDamage, hitInfo, victimState, subDamageCount, blockedAmount, totalAbsorb, totalResist)
+    self:Write9("SWING", attackerGuid, targetGuid, totalDamage, hitInfo, victimState, subDamageCount, blockedAmount, totalAbsorb, totalResist)
 end
 
 --- Handles SPELL_HEAL_BY_SELF events.
@@ -627,7 +1052,7 @@ end
 function ChronicleLog:SPELL_HEAL_BY_SELF(targetGuid, casterGuid, spellId, amount, critical, periodic)
     self:CheckUnit(targetGuid)
     self:CheckUnit(casterGuid)
-    self:Write("HEAL", targetGuid, casterGuid, spellId, amount, critical, periodic)
+    self:Write6("HEAL", targetGuid, casterGuid, spellId, amount, critical, periodic)
 end
 
 --- Handles SPELL_HEAL_BY_OTHER events.
@@ -644,7 +1069,7 @@ end
 function ChronicleLog:SPELL_HEAL_BY_OTHER(targetGuid, casterGuid, spellId, amount, critical, periodic)
     self:CheckUnit(targetGuid)
     self:CheckUnit(casterGuid)
-    self:Write("HEAL", targetGuid, casterGuid, spellId, amount, critical, periodic)
+    self:Write6("HEAL", targetGuid, casterGuid, spellId, amount, critical, periodic)
 end
 
 --- Handles SPELL_HEAL_ON_SELF events.
@@ -682,7 +1107,7 @@ end
 function ChronicleLog:SPELL_ENERGIZE_BY_SELF(targetGuid, casterGuid, spellId, powerType, amount, periodic)
     self:CheckUnit(targetGuid)
     self:CheckUnit(casterGuid)
-    self:Write("ENERGIZE", targetGuid, casterGuid, spellId, powerType, amount, periodic)
+    self:Write6("ENERGIZE", targetGuid, casterGuid, spellId, powerType, amount, periodic)
 end
 
 --- Handles SPELL_ENERGIZE_BY_OTHER events.
@@ -700,7 +1125,7 @@ end
 function ChronicleLog:SPELL_ENERGIZE_BY_OTHER(targetGuid, casterGuid, spellId, powerType, amount, periodic)
     self:CheckUnit(targetGuid)
     self:CheckUnit(casterGuid)
-    self:Write("ENERGIZE", targetGuid, casterGuid, spellId, powerType, amount, periodic)
+    self:Write6("ENERGIZE", targetGuid, casterGuid, spellId, powerType, amount, periodic)
 end
 
 --- Handles SPELL_ENERGIZE_ON_SELF events.
@@ -735,7 +1160,7 @@ end
 function ChronicleLog:SPELL_MISS_SELF(casterGuid, targetGuid, spellId, missInfo)
     self:CheckUnit(casterGuid)
     self:CheckUnit(targetGuid)
-    self:Write("MISS", casterGuid, targetGuid, spellId, missInfo)
+    self:Write4("MISS", casterGuid, targetGuid, spellId, missInfo)
 end
 
 --- Handles SPELL_MISS_OTHER events.
@@ -751,7 +1176,7 @@ end
 function ChronicleLog:SPELL_MISS_OTHER(casterGuid, targetGuid, spellId, missInfo)
     self:CheckUnit(casterGuid)
     self:CheckUnit(targetGuid)
-    self:Write("MISS", casterGuid, targetGuid, spellId, missInfo)
+    self:Write4("MISS", casterGuid, targetGuid, spellId, missInfo)
 end
 
 --- Handles SPELL_DISPEL_BY_SELF events.
@@ -765,7 +1190,7 @@ function ChronicleLog:SPELL_DISPEL_BY_SELF(casterGuid, targetGuid, spellId)
 
     self:CheckUnit(casterGuid)
     self:CheckUnit(targetGuid)
-    self:Write("DISPEL", casterGuid, targetGuid, spellId)
+    self:Write3("DISPEL", casterGuid, targetGuid, spellId)
 end
 
 --- Handles SPELL_DISPEL_BY_OTHER events.
@@ -779,7 +1204,7 @@ function ChronicleLog:SPELL_DISPEL_BY_OTHER(casterGuid, targetGuid, spellId)
 
     self:CheckUnit(casterGuid)
     self:CheckUnit(targetGuid)
-    self:Write("DISPEL", casterGuid, targetGuid, spellId)
+    self:Write3("DISPEL", casterGuid, targetGuid, spellId)
 end
 
 --- Handles ENVIRONMENTAL_DMG_SELF events.
@@ -793,7 +1218,7 @@ end
 ---@param resist number Amount of damage resisted
 function ChronicleLog:ENVIRONMENTAL_DMG_SELF(unitGuid, dmgType, damage, absorb, resist)
     self:CheckUnit(unitGuid)
-    self:Write("ENV_DMG", unitGuid, dmgType, damage, absorb, resist)
+    self:Write5("ENV_DMG", unitGuid, dmgType, damage, absorb, resist)
 end
 
 --- Handles ENVIRONMENTAL_DMG_OTHER events.
@@ -807,7 +1232,7 @@ end
 ---@param resist number Amount of damage resisted
 function ChronicleLog:ENVIRONMENTAL_DMG_OTHER(unitGuid, dmgType, damage, absorb, resist)
     self:CheckUnit(unitGuid)
-    self:Write("ENV_DMG", unitGuid, dmgType, damage, absorb, resist)
+    self:Write5("ENV_DMG", unitGuid, dmgType, damage, absorb, resist)
 end
 
 --- Handles DAMAGE_SHIELD_SELF events.
@@ -821,7 +1246,7 @@ end
 function ChronicleLog:DAMAGE_SHIELD_SELF(unitGuid, targetGuid, damage, spellSchool)
     self:CheckUnit(unitGuid)
     self:CheckUnit(targetGuid)
-    self:Write("DMG_SHIELD", unitGuid, targetGuid, damage, spellSchool)
+    self:Write4("DMG_SHIELD", unitGuid, targetGuid, damage, spellSchool)
 end
 
 --- Handles DAMAGE_SHIELD_OTHER events.
@@ -835,7 +1260,7 @@ end
 function ChronicleLog:DAMAGE_SHIELD_OTHER(unitGuid, targetGuid, damage, spellSchool)
     self:CheckUnit(unitGuid)
     self:CheckUnit(targetGuid)
-    self:Write("DMG_SHIELD", unitGuid, targetGuid, damage, spellSchool)
+    self:Write4("DMG_SHIELD", unitGuid, targetGuid, damage, spellSchool)
 end
 
 --- Handles AURA_CAST_ON_SELF events.
@@ -856,7 +1281,7 @@ end
 function ChronicleLog:AURA_CAST_ON_SELF(spellId, casterGuid, targetGuid, effect, effectAuraName, effectAmplitude, effectMiscValue, durationMs, auraCapStatus)
     self:CheckUnit(casterGuid)
     self:CheckUnit(targetGuid)
-    self:Write("AURA_CAST", spellId, casterGuid, targetGuid, effect, effectAuraName, effectAmplitude, effectMiscValue, durationMs, auraCapStatus)
+    self:Write9("AURA_CAST", spellId, casterGuid, targetGuid, effect, effectAuraName, effectAmplitude, effectMiscValue, durationMs, auraCapStatus)
 end
 
 --- Handles AURA_CAST_ON_OTHER events.
@@ -876,7 +1301,7 @@ end
 function ChronicleLog:AURA_CAST_ON_OTHER(spellId, casterGuid, targetGuid, effect, effectAuraName, effectAmplitude, effectMiscValue, durationMs, auraCapStatus)
     self:CheckUnit(casterGuid)
     self:CheckUnit(targetGuid)
-    self:Write("AURA_CAST", spellId, casterGuid, targetGuid, effect, effectAuraName, effectAmplitude, effectMiscValue, durationMs, auraCapStatus)
+    self:Write9("AURA_CAST", spellId, casterGuid, targetGuid, effect, effectAuraName, effectAmplitude, effectMiscValue, durationMs, auraCapStatus)
 end
 
 --- Handles BUFF_UPDATE_DURATION_SELF events.
@@ -919,7 +1344,7 @@ end
 ---@param state number 0=added, 1=removed, 2=modified (stack change)
 function ChronicleLog:BUFF_ADDED_SELF(guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
     self:CheckUnit(guid)
-    self:Write("BUFF_ADD", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
+    self:Write7("BUFF_ADD", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
 end
 
 --- Handles BUFF_REMOVED_SELF events.
@@ -934,7 +1359,7 @@ end
 ---@param state number 0=added, 1=removed, 2=modified (stack change)
 function ChronicleLog:BUFF_REMOVED_SELF(guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
     self:CheckUnit(guid)
-    self:Write("BUFF_REM", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
+    self:Write7("BUFF_REM", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
 end
 
 --- Handles BUFF_ADDED_OTHER events.
@@ -949,7 +1374,7 @@ end
 ---@param state number 0=added, 1=removed, 2=modified (stack change)
 function ChronicleLog:BUFF_ADDED_OTHER(guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
     self:CheckUnit(guid)
-    self:Write("BUFF_ADD", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
+    self:Write7("BUFF_ADD", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
 end
 
 --- Handles BUFF_REMOVED_OTHER events.
@@ -964,7 +1389,7 @@ end
 ---@param state number 0=added, 1=removed, 2=modified (stack change)
 function ChronicleLog:BUFF_REMOVED_OTHER(guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
     self:CheckUnit(guid)
-    self:Write("BUFF_REM", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
+    self:Write7("BUFF_REM", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
 end
 
 --- Handles DEBUFF_ADDED_SELF events.
@@ -979,7 +1404,7 @@ end
 ---@param state number 0=added, 1=removed, 2=modified (stack change)
 function ChronicleLog:DEBUFF_ADDED_SELF(guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
     self:CheckUnit(guid)
-    self:Write("DEBUFF_ADD", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
+    self:Write7("DEBUFF_ADD", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
     
     self:HandleTalentReset(guid, spellId)
 end
@@ -996,7 +1421,7 @@ end
 ---@param state number 0=added, 1=removed, 2=modified (stack change)
 function ChronicleLog:DEBUFF_REMOVED_SELF(guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
     self:CheckUnit(guid)
-    self:Write("DEBUFF_REM", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
+    self:Write7("DEBUFF_REM", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
 end
 
 --- Handles DEBUFF_ADDED_OTHER events.
@@ -1011,7 +1436,7 @@ end
 ---@param state number 0=added, 1=removed, 2=modified (stack change)
 function ChronicleLog:DEBUFF_ADDED_OTHER(guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
     self:CheckUnit(guid)
-    self:Write("DEBUFF_ADD", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
+    self:Write7("DEBUFF_ADD", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
     
     self:HandleTalentReset(guid, spellId)
 end
@@ -1028,7 +1453,7 @@ end
 ---@param state number 0=added, 1=removed, 2=modified (stack change)
 function ChronicleLog:DEBUFF_REMOVED_OTHER(guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
     self:CheckUnit(guid)
-    self:Write("DEBUFF_REM", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
+    self:Write7("DEBUFF_REM", guid, luaSlot, spellId, stackCount, auraLevel, auraSlot, state)
 end
 
 --- Handles SPELL_DAMAGE_EVENT_SELF events.
@@ -1049,7 +1474,7 @@ end
 function ChronicleLog:SPELL_DAMAGE_EVENT_SELF(targetGuid, casterGuid, spellId, amount, mitigationStr, hitInfo, spellSchool, effectAuraStr)
     self:CheckUnit(targetGuid)
     self:CheckUnit(casterGuid)
-    self:Write("SPELL_DMG", targetGuid, casterGuid, spellId, amount, mitigationStr, hitInfo, spellSchool, effectAuraStr)
+    self:Write8("SPELL_DMG", targetGuid, casterGuid, spellId, amount, mitigationStr, hitInfo, spellSchool, effectAuraStr)
 end
 
 --- Handles SPELL_DAMAGE_EVENT_OTHER events.
@@ -1070,7 +1495,7 @@ end
 function ChronicleLog:SPELL_DAMAGE_EVENT_OTHER(targetGuid, casterGuid, spellId, amount, mitigationStr, hitInfo, spellSchool, effectAuraStr)
     self:CheckUnit(targetGuid)
     self:CheckUnit(casterGuid)
-    self:Write("SPELL_DMG", targetGuid, casterGuid, spellId, amount, mitigationStr, hitInfo, spellSchool, effectAuraStr)
+    self:Write8("SPELL_DMG", targetGuid, casterGuid, spellId, amount, mitigationStr, hitInfo, spellSchool, effectAuraStr)
 end
 
 --- Handles SPELL_DELAYED_SELF events.
@@ -1080,7 +1505,7 @@ end
 ---@param delayMs number Delay in milliseconds
 function ChronicleLog:SPELL_DELAYED_SELF(casterGuid, delayMs)
     self:CheckUnit(casterGuid)
-    self:Write("SPELL_DELAY", casterGuid, delayMs)
+    self:Write2("SPELL_DELAY", casterGuid, delayMs)
 end
 
 --- Handles SPELL_DELAYED_OTHER events.
@@ -1091,7 +1516,7 @@ end
 ---@param delayMs number Delay in milliseconds
 function ChronicleLog:SPELL_DELAYED_OTHER(casterGuid, delayMs)
     self:CheckUnit(casterGuid)
-    self:Write("SPELL_DELAY", casterGuid, delayMs)
+    self:Write2("SPELL_DELAY", casterGuid, delayMs)
 end
 
 --- Handles SPELL_CHANNEL_START events.
@@ -1103,7 +1528,7 @@ end
 ---@param durationMs number Channel duration in milliseconds
 function ChronicleLog:SPELL_CHANNEL_START(spellId, targetGuid, durationMs)
     self:CheckUnit(targetGuid)
-    self:Write("CHANNEL_START", spellId, targetGuid, durationMs)
+    self:Write3("CHANNEL_START", spellId, targetGuid, durationMs)
 end
 
 --- Handles SPELL_CHANNEL_UPDATE events.
@@ -1115,7 +1540,7 @@ end
 ---@param remainingMs number Remaining channel time in milliseconds
 function ChronicleLog:SPELL_CHANNEL_UPDATE(spellId, targetGuid, remainingMs)
     self:CheckUnit(targetGuid)
-    self:Write("CHANNEL_UPDATE", spellId, targetGuid, remainingMs)
+    self:Write3("CHANNEL_UPDATE", spellId, targetGuid, remainingMs)
 end
 
 --- Handles SPELL_FAILED_SELF events.
@@ -1128,7 +1553,7 @@ end
 function ChronicleLog:SPELL_FAILED_SELF(spellId, spellResult, failedByServer)
     local _, playerGuid = UnitExists("player")
     -- Reordering parameters to keep the same as `SPELL_FAILED_OTHER`
-    self:Write("SPELL_FAIL", playerGuid, spellId, failedByServer == 1, spellResult)
+    self:Write4("SPELL_FAIL", playerGuid, spellId, failedByServer == 1, spellResult)
 end
 
 --- Handles SPELL_FAILED_OTHER events.
@@ -1139,7 +1564,7 @@ end
 ---@param spellId number Spell ID that failed
 function ChronicleLog:SPELL_FAILED_OTHER(casterGuid, spellId)
     self:CheckUnit(casterGuid)
-    self:Write("SPELL_FAIL", casterGuid, spellId, true)
+    self:Write3("SPELL_FAIL", casterGuid, spellId, true)
 end
 
 --- Handles SPELL_GO_SELF events.
@@ -1157,7 +1582,7 @@ end
 function ChronicleLog:SPELL_GO_SELF(itemId, spellId, casterGuid, targetGuid, castFlags, numTargetsHit, numTargetsMissed)
     self:CheckUnit(casterGuid)
     self:CheckUnit(targetGuid)
-    self:Write("SPELL_GO", itemId, spellId, casterGuid, targetGuid, castFlags, numTargetsHit, numTargetsMissed)
+    self:Write7("SPELL_GO", itemId, spellId, casterGuid, targetGuid, castFlags, numTargetsHit, numTargetsMissed)
 end
 
 --- Handles SPELL_GO_OTHER events.
@@ -1175,7 +1600,7 @@ end
 function ChronicleLog:SPELL_GO_OTHER(itemId, spellId, casterGuid, targetGuid, castFlags, numTargetsHit, numTargetsMissed)
     self:CheckUnit(casterGuid)
     self:CheckUnit(targetGuid)
-    self:Write("SPELL_GO", itemId, spellId, casterGuid, targetGuid, castFlags, numTargetsHit, numTargetsMissed)
+    self:Write7("SPELL_GO", itemId, spellId, casterGuid, targetGuid, castFlags, numTargetsHit, numTargetsMissed)
 end
 
 --- Handles SPELL_START_SELF events.
@@ -1194,7 +1619,7 @@ end
 function ChronicleLog:SPELL_START_SELF(itemId, spellId, casterGuid, targetGuid, castFlags, castTime, duration, spellType)
     self:CheckUnit(casterGuid)
     self:CheckUnit(targetGuid)
-    self:Write("SPELL_START", itemId, spellId, casterGuid, targetGuid, castFlags, castTime, duration, spellType)
+    self:Write8("SPELL_START", itemId, spellId, casterGuid, targetGuid, castFlags, castTime, duration, spellType)
 end
 
 --- Handles SPELL_START_OTHER events.
@@ -1215,7 +1640,7 @@ end
 function ChronicleLog:SPELL_START_OTHER(itemId, spellId, casterGuid, targetGuid, castFlags, castTime, duration, spellType)
     self:CheckUnit(casterGuid)
     self:CheckUnit(targetGuid)
-    self:Write("SPELL_START", itemId, spellId, casterGuid, targetGuid, castFlags, castTime, duration, spellType)
+    self:Write8("SPELL_START", itemId, spellId, casterGuid, targetGuid, castFlags, castTime, duration, spellType)
 end
 
 -- =============================================================================
@@ -1300,7 +1725,7 @@ function ChronicleLog:CHAT_MSG_LOOT(msg)
     end
 
     Chronicle:DebugPrint("LOOT: " .. looter .. " - " .. itemLink)
-    self:Write("LOOT", looter, itemLink)
+    self:Write2("LOOT", looter, itemLink)
 end
 
 --- Handles CHAT_MSG_SYSTEM events.
@@ -1312,7 +1737,7 @@ function ChronicleLog:CHAT_MSG_SYSTEM(msg)
     
     -- Check for trade pattern: "Iseut trades item Libram of the Faithful to Milkpress."
     if strfind(msg, "^%w+ trades item") then
-        self:Write("LOOT_TRADE", msg)
+        self:Write1("LOOT_TRADE", msg)
     end
 end
 
@@ -1343,7 +1768,7 @@ end
 --- Handles PLAYER_LEAVING_WORLD events.
 --- Flushes the log buffer to file on logout/disconnect/reload.
 function ChronicleLog:PLAYER_LEAVING_WORLD()
-    if self.bufferSize > 0 then
+    if self.bufferSize > 0 or self.pendingFlush then
         self:FlushToFile()
     end
 end

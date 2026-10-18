@@ -310,6 +310,24 @@ function ChronicleLog:CreateOptionsPanel()
     npVerText:SetPoint("LEFT", npVerLabel, "RIGHT", 5, 0)
     panel.npVerText = npVerText
     
+    yLeft = yLeft - 14
+    
+    local caVerLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    caVerLabel:SetPoint("TOPLEFT", leftCol, yLeft)
+    caVerLabel:SetText("ClassicAPI:")
+    local caVerText = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    caVerText:SetPoint("LEFT", caVerLabel, "RIGHT", 5, 0)
+    panel.caVerText = caVerText
+    
+    yLeft = yLeft - 14
+    
+    local swVerLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    swVerLabel:SetPoint("TOPLEFT", leftCol, yLeft)
+    swVerLabel:SetText("SuperWoW:")
+    local swVerText = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    swVerText:SetPoint("LEFT", swVerLabel, "RIGHT", 5, 0)
+    panel.swVerText = swVerText
+    
     yLeft = yLeft - 22
     
     -- =========================================================================
@@ -550,6 +568,7 @@ end
 --- Archives current logs to a backup file with the given suffix, then clears logs.
 --- @param suffix string - suffix for the backup filename (e.g. "backup" or a user-entered label)
 function ChronicleLog:ArchiveLogs(suffix)
+    self:FinishPendingFlush()
     local currentFile = self:GetLogFilename()
     local timestamp = time()
     -- Derive backup name from the current filename (respects includeRealmInFilename)
@@ -576,6 +595,7 @@ end
 
 --- Deletes all current logs (disk and memory).
 function ChronicleLog:DeleteLogs()
+    self.pendingFlush = nil
     local filename = self:GetLogFilename()
     ChronicleFile:WriteFile(filename, "")
     self:ClearBuffer()
@@ -667,6 +687,20 @@ function ChronicleLog:RefreshOptionsPanel()
     panel.addonVerText:SetText("|cff" .. addonColor .. addonVer .. "|r")
     local npVer, npColor = self:CheckVersion("nampower")
     panel.npVerText:SetText("|cff" .. npColor .. npVer .. "|r")
+    -- optional mods: green when loaded, grey otherwise
+    local caVer = Chronicle_ClassicAPIVersion()
+    if caVer == "" then
+        panel.caVerText:SetText("|cff808080Not loaded|r")
+    elseif caVer == "unknown" then
+        panel.caVerText:SetText("|cffffff00loaded, version unknown|r")
+    else
+        panel.caVerText:SetText("|cff00ff00" .. caVer .. "|r")
+    end
+    if SUPERWOW_VERSION then
+        panel.swVerText:SetText("|cff00ff00" .. tostring(SUPERWOW_VERSION) .. "|r")
+    else
+        panel.swVerText:SetText("|cff808080Not loaded|r")
+    end
     
     panel.autoRaidCheck:SetChecked(self:GetSetting("autoEnableInRaid"))
     panel.autoDungeonCheck:SetChecked(self:GetSetting("autoEnableInDungeon"))
