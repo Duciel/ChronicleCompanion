@@ -235,8 +235,18 @@ local MISSING = {
 }
 
 function Ursol:DetectCaps()
-    self:DetectPositionApi()
     local caps = self.caps
+    caps.client = Chronicle_IsUrsolClient()
+    if not caps.client then
+        self.positionApi = "none"
+        caps.fields = false
+        caps.guid = false
+        caps.position = false
+        caps.marks = false
+        return
+    end
+
+    self:DetectPositionApi()
     caps.fields = GetUnitField ~= nil
     caps.guid = GetUnitGUID ~= nil or SUPERWOW_VERSION ~= nil
     caps.position = caps.fields and (self.positionApi == "classicapi" or self.positionApi == "superwow")
@@ -245,6 +255,7 @@ end
 
 --- True when the client can produce this line type.
 function Ursol:Available(key)
+    if not self.caps.client then return false end
     local need = NEEDS[key]
     return not need or self.caps[need] and true or false
 end
@@ -252,6 +263,7 @@ end
 --- Text explaining why a line type is unavailable, or nil.
 function Ursol:MissingText(key)
     if self:Available(key) then return nil end
+    if not self.caps.client then return "needs the Ursol client" end
     -- positions are written in UNIT_STATE lines, which need Nampower first
     if key == "position" and not self.caps.fields then return MISSING.fields end
     return MISSING[NEEDS[key]]
@@ -271,6 +283,7 @@ local function Round(value, decimals)
 end
 
 function Ursol:ThreatQueryActive()
+    if not self:Available("threat") then return false end
     local mode = self:Get("threatQuery")
     if mode == "on" then return true end
     if mode == "off" then return false end
@@ -769,7 +782,7 @@ end
 
 local originalChatMsgAddon = ChronicleLog.CHAT_MSG_ADDON
 function ChronicleLog:CHAT_MSG_ADDON(prefix, message, channel, sender)
-    if message and Ursol:Get("threat") then
+    if message and Ursol:Active("threat") then
         if strfind(message, THREAT_API, 1, true) then
             Ursol:HandleServerThreat(message)
             return
@@ -840,7 +853,7 @@ Ursol.frame:SetScript("OnUpdate", function()
         Ursol:ScanMarks()
     end
 
-    if inCombat and Ursol:Get("threat") and Ursol:ThreatQueryActive()
+    if inCombat and Ursol:Active("threat") and Ursol:ThreatQueryActive()
         and now - Ursol.lastQuery >= math.max(0.3, tonumber(Ursol:Get("threatInterval")) or 1) then
         Ursol.lastQuery = now
         Ursol:QueryThreat()
@@ -876,9 +889,13 @@ local NUM_KEYS = { targetInterval = true, positionInterval = true, positionMinMo
 
 function Ursol:Status()
     self:DetectCaps()
-    Chronicle:Print("Ursol log format v" .. self.formatVersion .. " - position API: " .. self.positionApi
-        .. ", threat: " .. (self:ThreatQueryActive() and "query" or "listen only")
-        .. " (" .. self:ThreatServerText() .. ")")
+    if not self.caps.client then
+        Chronicle:Print("Ursol log format v" .. self.formatVersion .. " - unavailable: needs the Ursol client")
+    else
+        Chronicle:Print("Ursol log format v" .. self.formatVersion .. " - position API: " .. self.positionApi
+            .. ", threat: " .. (self:ThreatQueryActive() and "query" or "listen only")
+            .. " (" .. self:ThreatServerText() .. ")")
+    end
     for key in pairs(DEFAULTS) do
         local missing = self:MissingText(key)
         Chronicle:Print("  " .. key .. " = " .. tostring(self:Get(key))
@@ -1031,9 +1048,11 @@ function Ursol:RefreshOptions()
 
     local mode = self:Get("threatQuery")
     side.queryButton:SetText(mode)
-    if self:Get("threat") then side.queryButton:Enable() else side.queryButton:Disable() end
+    if self:Active("threat") then side.queryButton:Enable() else side.queryButton:Disable() end
     local active = self:ThreatQueryActive()
-    if mode == "auto" then
+    if not self.caps.client then
+        side.queryDesc:SetText("off: needs the Ursol client")
+    elseif mode == "auto" then
         if active then
             side.queryDesc:SetText("auto: no threat addon, this addon asks")
         elseif (TWT and TWT.UDTS) or (pfUI and pfUI.threatplates) then

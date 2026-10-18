@@ -53,6 +53,15 @@ function ChronicleCompareVersion(v1, v2)
 end
 
 
+--- True when running the Turtle WoW 1.18.1 Ursol client build.
+--- Capability APIs alone are not sufficient because native 1.12 clients can
+--- expose them through extensions such as Nampower, ClassicAPI, or SuperWoW.
+function Chronicle_IsUrsolClient()
+    local _, build = GetBuildInfo()
+    return tonumber(build) == 7272
+end
+
+
 function Chronicle_NampowerVersion()
     local version = ""
     if GetNampowerVersion then
