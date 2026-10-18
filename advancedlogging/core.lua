@@ -18,10 +18,9 @@ ChronicleLog = {
     raidGroupRetryCount = 0,
 }
 
--- Detect Turtle WoW (build 7272) vs vanilla 1.12 (build 5875)
--- Transmog and remote talent inspection are Turtle WoW-only features.
-local _, wowBuild = GetBuildInfo()
-ChronicleLog.isTurtleWow = (tonumber(wowBuild) == 7272)
+-- Detect Turtle WoW (build 7272) vs vanilla 1.12 (build 5875).
+-- Transmog, remote talent inspection, and Ursol events are Turtle WoW-only.
+ChronicleLog.isTurtleWow = Chronicle_IsUrsolClient()
 
 
 -- Delimiter for log output format: TIMESTAMP|EVENT_TYPE|field1|field2|...
@@ -315,7 +314,7 @@ function ChronicleLog:GenerateHeader()
     -- Client mods and threat logging mode (see advancedlogging/ursol.lua)
     local classicApi = Chronicle_ClassicAPIVersion()
     local threatMode = ""
-    if ChronicleUrsol and ChronicleUrsol:Get("threat") then
+    if ChronicleUrsol and ChronicleUrsol:Active("threat") then
         threatMode = ChronicleUrsol:ThreatQueryActive() and "query" or "listen"
     end
     
