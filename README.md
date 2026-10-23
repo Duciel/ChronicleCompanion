@@ -83,6 +83,7 @@ tools/install_lua_5_0_3.sh .cache/lua-5.0.3
 .cache/lua-5.0.3/bin/lua tests/raid_composition_test.lua
 .cache/lua-5.0.3/bin/lua tests/ursol_client_test.lua
 .cache/lua-5.0.3/bin/lua tests/write_correctness_test.lua
+.cache/lua-5.0.3/bin/lua tests/talent_invalidation_test.lua
 ```
 
 ## License

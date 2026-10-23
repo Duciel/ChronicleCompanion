@@ -764,6 +764,7 @@ function ChronicleLog:ZONE_CHANGED_NEW_AREA()
     self:WriteZoneInfo(true)
     if self:IsEnabled() then
         self:PurgeUnits()
+        self:PurgeTalentCache()
         if isRaid then
             -- Zone boundaries need a complete snapshot even when the roster is unchanged.
             self:ScheduleRaidGroupCapture(0, "ZONE_CHANGED_NEW_AREA", true)
