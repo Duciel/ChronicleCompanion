@@ -30,3 +30,5 @@ jobs:
         run: '"$RUNNER_TEMP/lua-5.0.3/bin/lua" tests/ursol_client_test.lua'
       - name: Run writer correctness tests
         run: '"$RUNNER_TEMP/lua-5.0.3/bin/lua" tests/write_correctness_test.lua'
+      - name: Run talent invalidation tests
+        run: '"$RUNNER_TEMP/lua-5.0.3/bin/lua" tests/talent_invalidation_test.lua'

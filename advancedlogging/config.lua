@@ -586,6 +586,7 @@ function ChronicleLog:ArchiveLogs(suffix)
     ChronicleFile:WriteFile(currentFile, "")
     self:ClearBuffer()
     self:PurgeUnits()
+    self:PurgeTalentCache()
     ChronicleCompanionCharDB.lastInstanceIds = {}
     self:WriteZoneInfo(true)
     Chronicle:Print("Archived logs to: " .. newFile)
