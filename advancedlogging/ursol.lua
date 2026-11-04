@@ -59,8 +59,8 @@ local TANKMODE_API = "TMTv1="
 local RELAY_API = "TWTRelayV2:"
 local TANKSHARE_API = "PFTPTankV1:"
 local UDTS_TM = "TWT_UDTSv4_TM"
--- auto mode: requests stop after this many without any answer (server without
--- the TWThreat API, e.g. a plain 1.12 server); one answer turns them back on
+-- requests stop after this many without any answer (server without the
+-- TWThreat API, e.g. a plain 1.12 server); one answer turns them back on
 local MAX_UNANSWERED_QUERIES = 10
 
 -- Default settings (stored in ChronicleCompanionDB.advancedLog with an "ursol_" prefix)
@@ -74,7 +74,8 @@ local DEFAULTS = {
     positionMinMove = 0.5,
     marks = true,
     threat = true,
-    threatQuery = "auto",   -- "auto": only if TWThreat / pfUI-ThreatPlates are not loaded, "on", "off"
+    threatQuery = "on",     -- "on": always ask the server, "auto": only if TWThreat / pfUI-ThreatPlates
+                            -- are not loaded, "off": only listen
     threatInterval = 1.0,
     threatLimit = 40,       -- whole raid: lets the bottom of the threat table be logged too
 }
@@ -291,12 +292,14 @@ end
 
 function Ursol:ThreatQueryActive()
     local mode = self:Get("threatQuery")
-    if mode == "on" then return true end
     if mode == "off" then return false end
-    -- auto: let TWThreat / pfUI-ThreatPlates do the querying, we only listen
-    if TWT and TWT.UDTS then return false end
-    if pfUI and pfUI.threatplates then return false end
-    -- and stop asking a server that never answers (no TWThreat API)
+    if mode == "auto" then
+        -- let TWThreat / pfUI-ThreatPlates do the querying, we only listen
+        if TWT and TWT.UDTS then return false end
+        if pfUI and pfUI.threatplates then return false end
+    end
+    -- whatever the mode, stop asking a server that never answers (no TWThreat
+    -- API, e.g. a plain 1.12 server); one answer turns requests back on
     if not self.threatServer and self.threatUnanswered >= MAX_UNANSWERED_QUERIES then
         return false
     end
@@ -947,7 +950,6 @@ local UI_TOGGLES = {
     { key = "marks", label = "Raid marks", desc = "RAID_MARK" },
     { key = "threat", label = "Threat", desc = "THREAT, THREAT_TANK" },
 }
-local THREAT_QUERY_NEXT = { auto = "on", on = "off", off = "auto" }
 
 function Ursol:CreateOptions(panel)
     local side = CreateFrame("Frame", "ChronicleUrsolOptions", panel)
@@ -991,25 +993,23 @@ function Ursol:CreateOptions(panel)
         y = y - 34
     end
 
-    -- threat requests: auto / on / off
-    local queryLabel = side:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    queryLabel:SetPoint("TOPLEFT", 36, y - 4)
-    queryLabel:SetText("Server requests:")
-    local queryButton = CreateFrame("Button", "ChronicleUrsolThreatQuery", side, "UIPanelButtonTemplate")
-    queryButton:SetWidth(55)
-    queryButton:SetHeight(18)
-    queryButton:SetPoint("LEFT", queryLabel, "RIGHT", 6, 0)
-    queryButton:SetScript("OnClick", function()
-        Ursol:Set("threatQuery", THREAT_QUERY_NEXT[Ursol:Get("threatQuery")] or "auto")
+    -- threat requests: checked = "on" (always ask the server for the full table),
+    -- unchecked = "auto" (ask only when TWThreat / pfUI-ThreatPlates are absent).
+    -- "off" (only listen) stays available with /chronicle ursol threatQuery off.
+    local query = CreateFrame("CheckButton", "ChronicleUrsolThreatQuery", side, "UICheckButtonTemplate")
+    query:SetPoint("TOPLEFT", 36, y)
+    getglobal(query:GetName() .. "Text"):SetText("Ask the server")
+    query:SetScript("OnClick", function()
+        Ursol:Set("threatQuery", this:GetChecked() == 1 and "on" or "auto")
         Ursol:RefreshOptions()
     end)
-    side.queryButton = queryButton
+    side.queryCheck = query
     local queryDesc = side:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-    queryDesc:SetPoint("TOPLEFT", 36, y - 20)
-    queryDesc:SetWidth(180)
+    queryDesc:SetPoint("TOPLEFT", 62, y - 20)
+    queryDesc:SetWidth(170)
     queryDesc:SetJustifyH("LEFT")
     side.queryDesc = queryDesc
-    y = y - 58
+    y = y - 50
 
     local help = side:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
     help:SetPoint("TOPLEFT", 20, y)
@@ -1049,21 +1049,27 @@ function Ursol:RefreshOptions()
     end
 
     local mode = self:Get("threatQuery")
-    side.queryButton:SetText(mode)
-    if self:Get("threat") then side.queryButton:Enable() else side.queryButton:Disable() end
-    local active = self:ThreatQueryActive()
-    if mode == "auto" then
-        if active then
-            side.queryDesc:SetText("auto: no threat addon, this addon asks")
-        elseif (TWT and TWT.UDTS) or (pfUI and pfUI.threatplates) then
-            side.queryDesc:SetText("auto: TWThreat / ThreatPlates ask, this addon listens")
-        else
-            side.queryDesc:SetText("auto: no server answer, requests stopped")
-        end
-    elseif mode == "on" then
-        side.queryDesc:SetText("on: this addon always asks the server")
+    local query = side.queryCheck
+    query:SetChecked(mode == "on" and 1 or nil)
+    if self:Get("threat") then
+        query:Enable()
+        getglobal(query:GetName() .. "Text"):SetTextColor(1, 1, 1)
     else
-        side.queryDesc:SetText("off: only listens to other addons")
+        query:Disable()
+        getglobal(query:GetName() .. "Text"):SetTextColor(0.5, 0.5, 0.5)
+    end
+    local active = self:ThreatQueryActive()
+    local twt = (TWT and TWT.UDTS) or (pfUI and pfUI.threatplates)
+    if mode == "off" then
+        side.queryDesc:SetText("off: only listens (/chronicle ursol)")
+    elseif not active and not (mode == "auto" and twt) then
+        side.queryDesc:SetText("|cffff6060no server answer, requests stopped|r")
+    elseif mode == "on" then
+        side.queryDesc:SetText("full table, up to " .. (tonumber(self:Get("threatLimit")) or 40) .. " players")
+    elseif twt then
+        side.queryDesc:SetText("TWThreat / ThreatPlates ask, only listens")
+    else
+        side.queryDesc:SetText("asks: no threat addon loaded")
     end
 end
 

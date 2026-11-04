@@ -1,4 +1,4 @@
-# ChronicleCompanion — OctoWoW fork (0.38.9)
+# ChronicleCompanion — OctoWoW fork (0.38.10)
 
 This fork keeps everything ChronicleCompanion 0.38 writes, plus:
 
@@ -146,7 +146,8 @@ rounded to 1 decimal).
 
 The options panel (`/clog` or `/chronicle config`) has an **Extra events**
 side panel on its right: one checkbox per line type (the Positions line shows
-which API gives them) and the threat request mode (auto / on / off). The
+which API gives them) and an **Ask the server** checkbox under Threat
+(checked = `threatQuery on`, unchecked = `auto`). The
 ClassicAPI and SuperWoW versions are listed under **Version Info** in the main
 panel, next to Nampower. Intervals are only in the slash
 command: `/chronicle ursol` lists the settings, `/chronicle ursol <setting>
@@ -159,7 +160,7 @@ command: `/chronicle ursol` lists the settings, `/chronicle ursol <setting>
 | targetInterval | 0.25 | seconds between target / combat flag / hostile health and power polls |
 | positionInterval | 1 | seconds between position polls (in combat) |
 | positionMinMove | 0.5 | yards a unit must move before a position change alone writes a line |
-| threatQuery | auto | `auto`: ask the server only if TWThreat and pfUI-ThreatPlates are absent, and stop after 10 requests without any answer (server without the threat API; an answer, even relayed by the group, turns them back on); `on`: always ask; `off`: only listen |
+| threatQuery | on | `on`: always ask the server for the threat table of your target (with `threatLimit` 40, the whole raid); `auto`: ask only if TWThreat and pfUI-ThreatPlates are absent, otherwise only record their answers; `off`: only listen. In `on` and `auto`, requests stop after 10 without any answer (server without the threat API); an answer, even relayed by the group, turns them back on |
 | threatInterval | 1 | seconds between threat requests |
 | threatLimit | 40 | players per threat table requested (40 = the whole raid, so low-threat players are logged too) |
 
