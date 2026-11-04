@@ -1,4 +1,4 @@
-# ChronicleCompanion — OctoWoW fork (0.38.7)
+# ChronicleCompanion — OctoWoW fork (0.38.9)
 
 This fork keeps everything ChronicleCompanion 0.38 writes, plus:
 
@@ -161,7 +161,7 @@ command: `/chronicle ursol` lists the settings, `/chronicle ursol <setting>
 | positionMinMove | 0.5 | yards a unit must move before a position change alone writes a line |
 | threatQuery | auto | `auto`: ask the server only if TWThreat and pfUI-ThreatPlates are absent, and stop after 10 requests without any answer (server without the threat API; an answer, even relayed by the group, turns them back on); `on`: always ask; `off`: only listen |
 | threatInterval | 1 | seconds between threat requests |
-| threatLimit | 10 | players per threat table requested |
+| threatLimit | 40 | players per threat table requested (40 = the whole raid, so low-threat players are logged too) |
 
 ## Limits
 
